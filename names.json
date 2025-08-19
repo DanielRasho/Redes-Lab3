@@ -1,0 +1,9 @@
+{
+  "type": "names",
+  "config": {
+    "A": {"host": "localhost", "port": 8001},
+    "B": {"host": "localhost", "port": 8002}, 
+    "C": {"host": "localhost", "port": 8003},
+    "D": {"host": "localhost", "port": 8004}
+  }
+}

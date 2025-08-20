@@ -2,6 +2,9 @@ import socket
 import threading
 import logging
 import json
+import uuid
+from collections import deque
+
 from datetime import datetime
 import time
 from src.algorithms.dijkstra import DijkstraAlgorithm
@@ -25,6 +28,11 @@ class Router:
         self.neighbors = {}  # Direct neighbors from topology
         self.active_connections = {}  # neighbor_id -> socket
         self.running = False
+        self._rx_seen_ids = set()
+        self._rx_seen_fifo = deque()
+        self._rx_seen_capacity = 50000
+        self._rx_seen_lock = threading.Lock()
+
         
         # Initialize routing algorithm
         self.routing_algorithm = self._create_routing_algorithm(algorithm)
@@ -174,7 +182,7 @@ class Router:
                 try:
                     packet = Packet.from_json(data.decode('utf-8'))
                     self._log_packet("RECEIVED", packet)
-                    self._process_packet(packet, client_socket)
+                    self._process_packet(packet, client_socket, None)
                 except Exception as e:
                     self.logger.error(f"Error processing packet: {e}")
         except Exception as e:
@@ -182,21 +190,23 @@ class Router:
         finally:
             client_socket.close()
     
-    def _process_packet(self, packet: Packet, from_socket: socket.socket):
+    def _process_packet(self, packet: Packet, from_socket: socket.socket, from_neighbor_id: Optional[str]):
         """Process an incoming packet"""
+        if packet.proto == "flooding":
+            if self._mark_rx_seen(packet):
+                return
+
         # Handle broadcast/multicast packets - don't route them, just process locally
         if packet.to_addr in ["broadcast", "multicast"]:
-            # Process the packet locally (for hello, LSA, etc.)
             self.routing_algorithm.process_packet(packet, "unknown")
             return
-        
+
         # Check if packet is for this router
         if packet.to_addr == self.router_id:
             if packet.type == "message":
                 self.logger.info(f"Message received: {packet.payload}")
                 print(f"\n{Colors.GREEN}[MESSAGE FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
             elif packet.type == "echo":
-                # Send echo reply
                 reply = Packet(
                     proto=packet.proto,
                     packet_type="echo_reply",
@@ -208,51 +218,59 @@ class Router:
             elif packet.type == "echo_reply":
                 print(f"\n{Colors.BLUE}[ECHO REPLY FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
             return
-        
+
         # Check TTL
         if not packet.decrement_ttl():
             self.logger.warning(f"[DROPPED] Packet TTL expired")
             return
-        
+
         # Forward packet using routing algorithm
         next_hop = self.routing_algorithm.process_packet(packet, "unknown")
-        
+
         if next_hop == "flood":
-            self._flood_packet(packet, from_socket)
+            self._flood_packet(packet, exclude_neighbor_id=from_neighbor_id)
         elif next_hop == "flood_lsa":
-            # Special case for LSA flooding (exclude sender)
-            self._flood_packet_except_sender(packet, from_socket)
+            self._flood_packet_except_sender(packet, exclude_neighbor_id=from_neighbor_id)
         elif next_hop:
             self._send_to_neighbor(packet, next_hop)
         else:
             self.logger.warning(f"[DROPPED] No route to destination {packet.to_addr}")
+
     
-    def _flood_packet_except_sender(self, packet: Packet, sender_socket: socket.socket):
-        """Flood packet to all neighbors except the sender"""
+    def _flood_packet_except_sender(self, packet: Packet, exclude_neighbor_id: Optional[str]):
+        """Flood packet to all neighbors except the sender (by neighbor_id)"""
+        self._ensure_msg_id(packet)
         flooded_count = 0
         for neighbor_id, neighbor_socket in self.active_connections.items():
-            if neighbor_socket != sender_socket:
-                try:
-                    neighbor_socket.send(packet.to_json().encode('utf-8'))
-                    flooded_count += 1
-                except Exception as e:
-                    self.logger.error(f"Error flooding LSA to {neighbor_id}: {e}")
-        
+            if exclude_neighbor_id and neighbor_id == exclude_neighbor_id:
+                continue
+            try:
+                neighbor_socket.send(packet.to_json().encode('utf-8'))
+                flooded_count += 1
+            except Exception as e:
+                self.logger.error(f"Error flooding LSA to {neighbor_id}: {e}")
+
         if flooded_count > 0:
             self._log_packet("FLOODED", packet, f"{flooded_count} neighbors")
+
     
-    def _flood_packet(self, packet: Packet, exclude_socket: socket.socket):
-        """Flood packet to all neighbors except sender"""
+    def _flood_packet(self, packet: Packet, exclude_neighbor_id: Optional[str]):
+        """Flood packet to all neighbors except the specified neighbor_id"""
+        self._ensure_msg_id(packet)
         for neighbor_id, neighbor_socket in self.active_connections.items():
-            if neighbor_socket != exclude_socket:
-                try:
-                    neighbor_socket.send(packet.to_json().encode('utf-8'))
-                    self._log_packet("FLOODED", packet, neighbor_id)
-                except Exception as e:
-                    self.logger.error(f"Error flooding to {neighbor_id}: {e}")
-    
+            if exclude_neighbor_id and neighbor_id == exclude_neighbor_id:
+                continue
+            try:
+                neighbor_socket.send(packet.to_json().encode('utf-8'))
+                self._log_packet("FLOODED", packet, neighbor_id)
+            except Exception as e:
+                self.logger.error(f"Error flooding to {neighbor_id}: {e}")
+
+
+        
     def _send_to_neighbor(self, packet: Packet, neighbor_id: str):
         """Send packet to specific neighbor"""
+        self._ensure_msg_id(packet)
         if neighbor_id in self.active_connections:
             try:
                 self.active_connections[neighbor_id].send(packet.to_json().encode('utf-8'))
@@ -264,13 +282,13 @@ class Router:
         """Forward packet using routing algorithm"""
         next_hop = self.routing_algorithm.get_next_hop(packet.to_addr)
         if next_hop == "flood":
-            self._flood_packet(packet, None)
+            self._flood_packet(packet, exclude_neighbor_id=None)
         elif next_hop:
             self._send_to_neighbor(packet, next_hop)
         else:
-            # Try to connect to destination directly if it's a neighbor
             if packet.to_addr in self.neighbors:
                 self._send_to_neighbor(packet, packet.to_addr)
+
     
     def _connect_to_neighbors(self):
         """Connect to all configured neighbors (non-blocking)"""
@@ -315,7 +333,7 @@ class Router:
                 try:
                     packet = Packet.from_json(data.decode('utf-8'))
                     self._log_packet("RECEIVED", packet, neighbor_id)
-                    self._process_packet(packet, neighbor_socket)
+                    self._process_packet(packet, neighbor_socket, neighbor_id)
                 except Exception as e:
                     self.logger.error(f"Error processing packet from {neighbor_id}: {e}")
         except Exception as e:
@@ -387,6 +405,7 @@ class Router:
     
     def _broadcast_packet(self, packet: Packet):
         """Broadcast packet to all active neighbors"""
+        self._ensure_msg_id(packet)
         for neighbor_id, neighbor_socket in self.active_connections.items():
             try:
                 neighbor_socket.send(packet.to_json().encode('utf-8'))
@@ -500,17 +519,23 @@ class Router:
                 print(f"{Colors.RED}Error: {e}{Colors.ENDC}")
     
     def _log_packet(self, action: str, packet: Packet, neighbor: str = None):
-        """Log packet activity"""
+        """Log packet activity (now also shows headers['msg_id'])"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         neighbor_info = f" via {neighbor}" if neighbor else ""
-        log_entry = f"{timestamp} [{action}]{neighbor_info} {packet.type} from {packet.from_addr} to {packet.to_addr}"
+        mid = None
+        try:
+            mid = getattr(packet, "headers", {}).get("msg_id")
+        except Exception:
+            mid = None
+        mid_info = f" [id={mid}]" if mid else ""
+        log_entry = f"{timestamp} [{action}]{neighbor_info} {packet.type}{mid_info} from {packet.from_addr} to {packet.to_addr}"
         
         self.packet_log.append(log_entry)
         self.logger.info(log_entry)
         
-        # Keep only last 100 log entries
         if len(self.packet_log) > 100:
             self.packet_log = self.packet_log[-100:]
+
     
     def stop(self):
         """Stop the router"""
@@ -520,3 +545,36 @@ class Router:
         for connection in self.active_connections.values():
             connection.close()
         self.logger.info(f"Router {self.router_id} stopped")
+
+    @staticmethod
+    def _ensure_msg_id(packet):
+        """
+        Ensure a stable unique id in packet.headers['msg_id'] for duplicate filtering.
+        """
+        if not getattr(packet, "headers", None) or not isinstance(packet.headers, dict):
+            packet.headers = {}
+        if "msg_id" not in packet.headers:
+            packet.headers["msg_id"] = uuid.uuid4().hex
+
+    def _mark_rx_seen(self, packet) -> bool:
+        """
+        Returns True if packet.headers['msg_id'] was already seen (duplicate).
+        Thread-safe LRU (set + deque).
+        """
+        try:
+            mid = packet.headers.get("msg_id")
+        except Exception:
+            mid = None
+        if not mid:
+            return False
+        with self._rx_seen_lock:
+            if mid in self._rx_seen_ids:
+                return True
+            if len(self._rx_seen_fifo) >= self._rx_seen_capacity:
+                old = self._rx_seen_fifo.popleft()
+                self._rx_seen_ids.discard(old)
+            self._rx_seen_fifo.append(mid)
+            self._rx_seen_ids.add(mid)
+            return False
+
+

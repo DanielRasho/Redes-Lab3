@@ -196,9 +196,23 @@ class Router:
             if self._mark_rx_seen(packet):
                 return
 
-        # Handle broadcast/multicast packets - don't route them, just process locally
+        # Broadcast/Multicast: LSR necesita multi-salto y conocer el vecino real
         if packet.to_addr in ["broadcast", "multicast"]:
-            self.routing_algorithm.process_packet(packet, "unknown")
+            neighbor_hint = from_neighbor_id if from_neighbor_id else "unknown"
+            decision = self.routing_algorithm.process_packet(packet, neighbor_hint)
+
+            if decision == "flood":
+                if not packet.decrement_ttl():
+                    self.logger.warning(f"[DROPPED] Broadcast TTL expired")
+                    return
+                self._flood_packet(packet, exclude_neighbor_id=from_neighbor_id)
+                return
+
+            if decision == "flood_lsa":
+                if not packet.decrement_ttl():
+                    self.logger.warning(f"[DROPPED] LSA TTL expired")
+                    return
+                self._flood_packet_except_sender(packet, exclude_neighbor_id=from_neighbor_id)
             return
 
         # Check if packet is for this router
@@ -225,7 +239,7 @@ class Router:
             return
 
         # Forward packet using routing algorithm
-        next_hop = self.routing_algorithm.process_packet(packet, "unknown")
+        next_hop = self.routing_algorithm.process_packet(packet, from_neighbor_id or "unknown")
 
         if next_hop == "flood":
             self._flood_packet(packet, exclude_neighbor_id=from_neighbor_id)

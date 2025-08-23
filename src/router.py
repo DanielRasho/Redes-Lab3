@@ -5,6 +5,9 @@ import json
 import uuid
 from collections import deque
 
+import asyncio
+import redis.asyncio as redis
+
 from datetime import datetime
 import time
 from src.algorithms.dijkstra import DijkstraAlgorithm
@@ -591,4 +594,377 @@ class Router:
             self._rx_seen_ids.add(mid)
             return False
 
-
+class RedisRouter:
+    """Redis pub/sub based router implementation"""
+    
+    def __init__(self, router_id: str, redis_host: str, redis_port: int, redis_password: str, algorithm: str):
+        self.router_id = router_id
+        self.redis_host = redis_host
+        self.redis_port = redis_port
+        self.redis_password = redis_password
+        self.redis_client = None
+        self.pubsub = None
+        
+        self.topology = {}  # Full network topology from config
+        self.node_channels = {}  # Node ID -> channel mapping
+        self.neighbors = {}  # Direct neighbors from topology
+        self.running = False
+        
+        # Initialize routing algorithm
+        self.routing_algorithm = self._create_routing_algorithm(algorithm)
+        
+        # Logger for this router
+        self.logger = logging.getLogger(f"RedisRouter-{router_id}")
+        
+        # Packet logging
+        self.packet_log = []
+        
+        # My channel for receiving messages
+        self.my_channel = None
+    
+    def _create_routing_algorithm(self, algorithm: str) -> RoutingAlgorithm:
+        """Factory method to create routing algorithm instance"""
+        algorithms = {
+            "flooding": FloodingAlgorithm,
+            "dijkstra": DijkstraAlgorithm,
+            "lsr": LinkStateRouting
+        }
+        
+        if algorithm not in algorithms:
+            raise ValueError(f"Unknown routing algorithm: {algorithm}")
+        
+        return algorithms[algorithm](self.router_id)
+    
+    def load_topology(self, topo_file: str):
+        """Load network topology from JSON file"""
+        try:
+            with open(topo_file, 'r') as f:
+                topo_data = json.load(f)
+                if topo_data.get("type") != "topo":
+                    raise ValueError("Invalid topology file format")
+                
+                self.topology = topo_data["config"]
+                self.neighbors = {neighbor: {} for neighbor in self.topology.get(self.router_id, [])}
+                
+                self.logger.info(f"Loaded topology: {self.router_id} -> {list(self.neighbors.keys())}")
+                
+                # For Dijkstra algorithm, pass the full topology
+                if isinstance(self.routing_algorithm, DijkstraAlgorithm):
+                    self.routing_algorithm.set_topology(self.topology)
+                else:
+                    # Update routing algorithm with topology info for other algorithms
+                    for neighbor_id in self.neighbors:
+                        self.routing_algorithm.update_neighbor(neighbor_id, {"cost": 1})
+                    
+        except Exception as e:
+            self.logger.error(f"Error loading topology: {e}")
+            raise
+    
+    def load_node_channels(self, names_file: str):
+        """Load node channel mappings from JSON file"""
+        try:
+            with open(names_file, 'r') as f:
+                names_data = json.load(f)
+                if names_data.get("type") != "names":
+                    raise ValueError("Invalid names file format")
+                
+                self.node_channels = names_data["config"]
+                self.my_channel = self.node_channels.get(self.router_id, {}).get("channel")
+                
+                if not self.my_channel:
+                    raise ValueError(f"No channel defined for router {self.router_id}")
+                
+                # Update neighbor information with channels
+                for neighbor_id in self.neighbors:
+                    if neighbor_id in self.node_channels:
+                        channel_info = self.node_channels[neighbor_id]
+                        self.neighbors[neighbor_id] = {
+                            "channel": channel_info["channel"],
+                            "cost": 1  # Default cost
+                        }
+                        # Update routing algorithm with complete neighbor info
+                        self.routing_algorithm.update_neighbor(neighbor_id, self.neighbors[neighbor_id])
+                
+                self.logger.info(f"Loaded channels for {len(self.node_channels)} nodes")
+                self.logger.info(f"My channel: {self.my_channel}")
+                
+        except Exception as e:
+            self.logger.error(f"Error loading node channels: {e}")
+            raise
+    
+    async def start(self):
+        """Start the Redis router"""
+        self.running = True
+        
+        # Connect to Redis
+        self.redis_client = redis.Redis(
+            host=self.redis_host,
+            port=self.redis_port,
+            password=self.redis_password,
+            decode_responses=True
+        )
+        
+        self.logger.info(f"Router {Colors.BOLD}{self.router_id}{Colors.ENDC} started with Redis pub/sub")
+        self.logger.info(f"Using routing algorithm: {Colors.BOLD}{self.routing_algorithm.get_name()}{Colors.ENDC}")
+        self.logger.info(f"Listening on channel: {Colors.BOLD}{self.my_channel}{Colors.ENDC}")
+        
+        # Create pubsub instance
+        self.pubsub = self.redis_client.pubsub()
+        
+        # Subscribe to our channel
+        await self.pubsub.subscribe(self.my_channel)
+        
+        # Start message listener
+        asyncio.create_task(self._message_listener())
+        
+        # Start user input handler
+        asyncio.create_task(self._handle_user_input())
+        
+        # Start periodic tasks (if needed)
+        asyncio.create_task(self._periodic_tasks())
+    
+    async def _message_listener(self):
+        """Listen for incoming Redis messages"""
+        try:
+            async for message in self.pubsub.listen():
+                if message['type'] == 'message':
+                    try:
+                        # Parse packet from Redis message
+                        packet_data = message['data']
+                        packet = Packet.from_json(packet_data)
+                        self._log_packet("RECEIVED", packet, f"channel:{message['channel']}")
+                        await self._process_packet(packet)
+                    except Exception as e:
+                        self.logger.error(f"Error processing Redis message: {e}")
+        except Exception as e:
+            if self.running:
+                self.logger.error(f"Error in message listener: {e}")
+    
+    async def _process_packet(self, packet: Packet):
+        """Process an incoming packet"""
+        # Handle broadcast/multicast packets - don't route them, just process locally
+        if packet.to_addr in ["broadcast", "multicast"]:
+            # Process the packet locally (for hello, LSA, etc.)
+            self.routing_algorithm.process_packet(packet, "unknown")
+            return
+        
+        # Check if packet is for this router
+        if packet.to_addr == self.router_id:
+            if packet.type == "message":
+                self.logger.info(f"Message received: {packet.payload}")
+                print(f"\n{Colors.GREEN}[MESSAGE FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
+            elif packet.type == "echo":
+                # Send echo reply
+                reply = Packet(
+                    proto=packet.proto,
+                    packet_type="echo_reply",
+                    from_addr=self.router_id,
+                    to_addr=packet.from_addr,
+                    payload=f"Echo reply from {self.router_id}"
+                )
+                await self._forward_packet(reply)
+            elif packet.type == "echo_reply":
+                print(f"\n{Colors.BLUE}[ECHO REPLY FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
+            return
+        
+        # Check TTL
+        if not packet.decrement_ttl():
+            self.logger.warning(f"[DROPPED] Packet TTL expired")
+            return
+        
+        # Forward packet using routing algorithm
+        next_hop = self.routing_algorithm.process_packet(packet, "unknown")
+        
+        if next_hop == "flood":
+            await self._flood_packet(packet)
+        elif next_hop == "flood_lsa":
+            # Special case for LSA flooding
+            await self._flood_packet(packet)
+        elif next_hop:
+            await self._send_to_neighbor(packet, next_hop)
+        else:
+            self.logger.warning(f"[DROPPED] No route to destination {packet.to_addr}")
+    
+    async def _forward_packet(self, packet: Packet):
+        """Forward packet using routing algorithm"""
+        next_hop = self.routing_algorithm.get_next_hop(packet.to_addr)
+        if next_hop == "flood":
+            await self._flood_packet(packet)
+        elif next_hop:
+            await self._send_to_neighbor(packet, next_hop)
+        else:
+            # Try to send directly if it's a known node
+            if packet.to_addr in self.node_channels:
+                await self._send_to_neighbor(packet, packet.to_addr)
+    
+    async def _send_to_neighbor(self, packet: Packet, neighbor_id: str):
+        """Send packet to specific neighbor via Redis channel"""
+        if neighbor_id in self.node_channels:
+            try:
+                target_channel = self.node_channels[neighbor_id]["channel"]
+                await self.redis_client.publish(target_channel, packet.to_json())
+                self._log_packet("FORWARDED", packet, neighbor_id)
+            except Exception as e:
+                self.logger.error(f"Error sending to {neighbor_id}: {e}")
+        else:
+            self.logger.warning(f"Unknown neighbor: {neighbor_id}")
+    
+    async def _flood_packet(self, packet: Packet):
+        """Flood packet to all neighbors"""
+        flooded_count = 0
+        for neighbor_id in self.neighbors:
+            if neighbor_id in self.node_channels:
+                try:
+                    target_channel = self.node_channels[neighbor_id]["channel"]
+                    await self.redis_client.publish(target_channel, packet.to_json())
+                    flooded_count += 1
+                except Exception as e:
+                    self.logger.error(f"Error flooding to {neighbor_id}: {e}")
+        
+        if flooded_count > 0:
+            self._log_packet("FLOODED", packet, f"{flooded_count} neighbors")
+    
+    async def _handle_user_input(self):
+        """Handle user input for sending messages"""
+        print(f"\n{Colors.BOLD}Redis Router {self.router_id} ready.{Colors.ENDC} Commands:")
+        print(f"  {Colors.CYAN}send <destination> <message>{Colors.ENDC} - Send message to destination")
+        print(f"  {Colors.CYAN}echo <destination>{Colors.ENDC} - Send echo to destination")
+        print(f"  {Colors.CYAN}neighbors{Colors.ENDC} - Show neighbors")
+        print(f"  {Colors.CYAN}routes{Colors.ENDC} - Show routing table")
+        print(f"  {Colors.CYAN}logs{Colors.ENDC} - Show packet logs")
+        print(f"  {Colors.CYAN}topology{Colors.ENDC} - Show network topology")
+        print(f"  {Colors.CYAN}channels{Colors.ENDC} - Show channel mappings")
+        print(f"  {Colors.CYAN}path <destination>{Colors.ENDC} - Show path to destination (Dijkstra only)")
+        print(f"  {Colors.CYAN}debug{Colors.ENDC} - Show routing algorithm state")
+        print(f"  {Colors.CYAN}quit{Colors.ENDC} - Exit router")
+        
+        while self.running:
+            try:
+                # Use asyncio to handle input without blocking
+                command_input = await asyncio.get_event_loop().run_in_executor(
+                    None, input, f"\n{Colors.BOLD}{self.router_id}>{Colors.ENDC} "
+                )
+                command = command_input.strip().split()
+                if not command:
+                    continue
+                
+                if command[0] == "send" and len(command) >= 3:
+                    destination = command[1]
+                    message = " ".join(command[2:])
+                    packet = Packet(
+                        proto=self.routing_algorithm.get_name(),
+                        packet_type="message",
+                        from_addr=self.router_id,
+                        to_addr=destination,
+                        payload=message
+                    )
+                    await self._forward_packet(packet)
+                    self._log_packet("SENT", packet)
+                
+                elif command[0] == "echo" and len(command) >= 2:
+                    destination = command[1]
+                    packet = Packet(
+                        proto=self.routing_algorithm.get_name(),
+                        packet_type="echo",
+                        from_addr=self.router_id,
+                        to_addr=destination,
+                        payload="Echo request"
+                    )
+                    await self._forward_packet(packet)
+                    self._log_packet("SENT", packet)
+                
+                elif command[0] == "neighbors":
+                    print(f"{Colors.BOLD}Neighbors:{Colors.ENDC}")
+                    for neighbor_id, info in self.neighbors.items():
+                        channel = info.get('channel', 'unknown')
+                        print(f"  {Colors.YELLOW}{neighbor_id}{Colors.ENDC}: channel:{channel}")
+                
+                elif command[0] == "routes":
+                    print(f"{Colors.BOLD}Routing table:{Colors.ENDC}")
+                    if not self.routing_algorithm.routing_table:
+                        print("  (empty)")
+                    else:
+                        for dest, next_hop in sorted(self.routing_algorithm.routing_table.items()):
+                            print(f"  {Colors.YELLOW}{dest}{Colors.ENDC} -> {Colors.CYAN}{next_hop}{Colors.ENDC}")
+                
+                elif command[0] == "topology":
+                    print(f"{Colors.BOLD}Network topology:{Colors.ENDC}")
+                    for node, neighbors in self.topology.items():
+                        status = f"{Colors.GREEN}(this node){Colors.ENDC}" if node == self.router_id else ""
+                        print(f"  {Colors.YELLOW}{node}{Colors.ENDC}{status}: {neighbors}")
+                
+                elif command[0] == "channels":
+                    print(f"{Colors.BOLD}Channel mappings:{Colors.ENDC}")
+                    for node_id, info in self.node_channels.items():
+                        status = f"{Colors.GREEN}(this node){Colors.ENDC}" if node_id == self.router_id else ""
+                        print(f"  {Colors.YELLOW}{node_id}{Colors.ENDC}{status}: {info['channel']}")
+                
+                elif command[0] == "path" and len(command) >= 2:
+                    destination = command[1]
+                    if isinstance(self.routing_algorithm, DijkstraAlgorithm):
+                        path = self.routing_algorithm.get_full_path(destination)
+                        if path:
+                            path_str = " → ".join(path)
+                            print(f"Path to {Colors.YELLOW}{destination}{Colors.ENDC}: {Colors.CYAN}{path_str}{Colors.ENDC}")
+                        else:
+                            print(f"No path to {Colors.YELLOW}{destination}{Colors.ENDC}")
+                    else:
+                        print("Path command only available for Dijkstra algorithm")
+                
+                elif command[0] == "debug":
+                    print(f"{Colors.BOLD}Routing Algorithm Debug Info:{Colors.ENDC}")
+                    print(f"  Algorithm: {Colors.YELLOW}{self.routing_algorithm.get_name()}{Colors.ENDC}")
+                    print(f"  Routing Table: {Colors.CYAN}{dict(self.routing_algorithm.routing_table)}{Colors.ENDC}")
+                    print(f"  Neighbors: {Colors.CYAN}{list(self.routing_algorithm.neighbors.keys())}{Colors.ENDC}")
+                    print(f"  My Channel: {Colors.MAGENTA}{self.my_channel}{Colors.ENDC}")
+                    
+                    if isinstance(self.routing_algorithm, DijkstraAlgorithm):
+                        print(f"  Topology: {Colors.MAGENTA}{self.routing_algorithm.topology}{Colors.ENDC}")
+                
+                elif command[0] == "logs":
+                    print(f"{Colors.BOLD}Recent packet logs:{Colors.ENDC}")
+                    for log_entry in self.packet_log[-10:]:
+                        print(f"  {log_entry}")
+                
+                elif command[0] == "quit":
+                    await self.stop()
+                    break
+                
+                else:
+                    print(f"{Colors.RED}Unknown command{Colors.ENDC}")
+            
+            except KeyboardInterrupt:
+                await self.stop()
+                break
+            except Exception as e:
+                print(f"{Colors.RED}Error: {e}{Colors.ENDC}")
+    
+    async def _periodic_tasks(self):
+        """Handle periodic tasks (simplified for Redis)"""
+        while self.running:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            # For Dijkstra, no periodic tasks needed
+            # For other algorithms, could add hello packet sending here
+    
+    def _log_packet(self, action: str, packet: Packet, info: str = None):
+        """Log packet activity"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        info_str = f" via {info}" if info else ""
+        log_entry = f"{timestamp} [{action}]{info_str} {packet.type} from {packet.from_addr} to {packet.to_addr}"
+        
+        self.packet_log.append(log_entry)
+        self.logger.info(log_entry)
+        
+        # Keep only last 100 log entries
+        if len(self.packet_log) > 100:
+            self.packet_log = self.packet_log[-100:]
+    
+    async def stop(self):
+        """Stop the Redis router"""
+        self.running = False
+        if self.pubsub:
+            await self.pubsub.unsubscribe()
+            await self.pubsub.close()
+        if self.redis_client:
+            await self.redis_client.close()
+        self.logger.info(f"Redis Router {self.router_id} stopped")

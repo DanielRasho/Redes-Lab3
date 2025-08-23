@@ -1,5 +1,11 @@
 # Lab 3 - Routers simulation
 
+## Dependencies
+
+```
+pip install redis
+```
+
 ## How to run
 
 Start a router node is as easy as **3 steps**:

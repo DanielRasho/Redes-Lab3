@@ -5,11 +5,10 @@ import sys
 import asyncio
 import redis.asyncio as redis
 
-from src.router import Router, RedisRouter
+from src.router import RedisRouter, SocketRouter
 from src.utils import setup_colored_logging, Colors
 
 setup_colored_logging()
-
 
 def main():
     parser = argparse.ArgumentParser(description="Router Network Simulation")
@@ -26,10 +25,11 @@ def main():
     if args.mode == "redis":
         asyncio.run(main_redis(args))
     else:
-        main_socket(args)
+        asyncio.run(main_socket(args))
 
 async def main_redis(args):
     """Main function for Redis mode"""
+    router = None
     try:
         # Load Redis configuration from names file
         with open(args.names, 'r') as f:
@@ -53,16 +53,20 @@ async def main_redis(args):
         
         # Start router
         await router.start()
-        
-        # Keep running until stopped
-        while router.running:
-            await asyncio.sleep(1)
             
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Shutting down Redis router {args.id}...{Colors.ENDC}")
+        if router:
+            router.stop()
+            # Give a moment for cleanup
+            await asyncio.sleep(1)
     except Exception as e:
         print(f"{Colors.RED}Configuration error: {e}{Colors.ENDC}")
+        if router:
+            router.stop()
         sys.exit(1)
 
-def main_socket(args):
+async def main_socket(args):
     """Main function for Socket mode"""
     try:
         # Load node addresses first to get this router's address
@@ -80,25 +84,21 @@ def main_socket(args):
             port = router_addr["port"]
         
         # Create socket router
-        router = Router(args.id, host, port, args.algorithm)
+        router = SocketRouter(args.id, host, port, args.algorithm)
         
         # Load topology and names
         router.load_topology(args.topo)
         router.load_node_addresses(args.names)
         
+        # Start router
+        await router.start()
+        
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Shutting down socket router {args.id}...{Colors.ENDC}")
+        router.stop()
     except Exception as e:
         print(f"{Colors.RED}Configuration error: {e}{Colors.ENDC}")
         sys.exit(1)
-    
-    try:
-        router.start()
-        
-        # Keep main thread alive
-        while router.running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}Shutting down router {args.id}...{Colors.ENDC}")
-        router.stop()
 
 if __name__ == "__main__":
     main()

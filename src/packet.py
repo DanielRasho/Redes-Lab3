@@ -6,7 +6,7 @@ class Packet:
     """Represents a network packet following the specified JSON pattern"""
     
     def __init__(self, proto: str, packet_type: str, from_addr: str, 
-                 to_addr: str, ttl: int = 10, headers: List[Dict] = None, 
+                 to_addr: str, ttl: int = 5, headers: List[Dict] = None, 
                  payload: str = ""):
         self.proto = proto
         self.type = packet_type

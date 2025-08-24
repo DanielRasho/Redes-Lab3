@@ -1,9 +1,9 @@
 {
   "type": "names",
   "config": {
-    "A": {"host": "localhost", "port": 8001},
-    "B": {"host": "localhost", "port": 8002}, 
-    "C": {"host": "localhost", "port": 8003},
-    "D": {"host": "localhost", "port": 8004}
+    "A": {"host": "192.168.56.1", "port": 8001},
+    "B": {"host": "192.168.56.1", "port": 8002},
+    "C": {"host": "192.168.0.28", "port": 8003},
+    "D": {"host": "192.168.0.28", "port": 8004}
   }
 }

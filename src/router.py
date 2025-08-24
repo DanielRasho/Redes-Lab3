@@ -141,7 +141,27 @@ class BaseRouter(ABC):
             return
 
         # Forward packet using routing algorithm
+        ###
+        # determine from_neighbor_id if we have the socket reference
+        from_neighbor_id = None
+        if from_socket is not None:
+            for nid, sock in self.active_connections.items():
+                if sock == from_socket:
+                    from_neighbor_id = nid
+                    break
+
+        # Ask the routing algorithm what to do
         next_hop = self.routing_algorithm.process_packet(packet, from_neighbor_id or "unknown")
+
+        # If packet is broadcast/multicast and algorithm didn't request a route,
+        # interpret that as "flood" (except for hello packets which shouldn't be retransmitted)
+        if next_hop is None and packet.to_addr in ["broadcast", "multicast"]:
+            if packet.type != "hello":
+                next_hop = "flood"
+            else:
+                # HELLO packets must not be retransmitted
+                next_hop = None
+
 
         if next_hop == "flood":
             self._flood_packet(packet, exclude_neighbor_id=from_neighbor_id)
@@ -219,14 +239,18 @@ class BaseRouter(ABC):
                 
                 # Send basic hello for flooding (neighbor discovery)
                 else:
+                    # REPLACE/ENSURE this block when creating hello packets for non-LSR algorithms
                     hello_packet = Packet(
-                        proto=self.routing_algorithm.get_name(),
+                        proto=self.routing_algorithm.get_name(),   # keep configurable
                         packet_type="hello",
                         from_addr=self.router_id,
                         to_addr="broadcast",
-                        payload=f"Hello from {self.router_id}"
+                        ttl=5,
+                        headers=[self.router_id],                  # <-- ensure this is present
+                        payload=""
                     )
                     self._broadcast_packet(hello_packet)
+
                     
             except Exception as e:
                 self.logger.error(f"Error in periodic tasks: {e}")

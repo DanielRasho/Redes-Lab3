@@ -1,77 +1,82 @@
-import json
-import time
-import uuid
-from typing import Dict, List, Optional, Tuple, Any
+# flooding.py
+from typing import Dict, List, Optional
 from src.algorithms.base import RoutingAlgorithm
 from src.packet import Packet
-from collections import deque
-
 
 class FloodingAlgorithm(RoutingAlgorithm):
-    """Flooding routing algorithm implementation"""
-    
+    """
+    Simple flooding algorithm that:
+      - does NOT retransmit 'hello' packets (HELLO used for neighbor intro)
+      - retransmits 'info' and other broadcast packets, maintaining a headers list
+      - uses headers as a 3-entry rolling window to detect loops (cycle detection)
+    """
+
     def __init__(self, router_id: str):
         super().__init__(router_id)
-        self.seen_packets = set()  # Track packet IDs to avoid loops
-        # src/algorithms/flooding.py
-        self._seen_ids: set[str] = set()
-        self._seen_fifo: deque[str] = deque()
-        self._seen_capacity: int = 50000  # tamaño del filtro (LRU simple)
+        self.neighbors: Dict[str, dict] = {}
 
-    
     def get_name(self) -> str:
         return "flooding"
-    
-    def process_packet(self, packet: Packet, from_neighbor: str) -> Optional[str]:
-        # --- New duplicate filter based on a stable per-message ID in headers['msg_id'] ---
-        mid = _ensure_msg_id(packet)
-        if _mark_seen_LRU(mid, self._seen_ids, self._seen_fifo, self._seen_capacity):
-            return None  # Duplicate detected via msg_id, do not forward
 
-        # --- Existing heuristic fallback (kept as-is) ---
-        packet_id = f"{packet.from_addr}-{packet.to_addr}-{packet.payload[:20]}"
-        if packet_id in self.seen_packets:
-            return None  # Already seen, don't forward
-        
-        self.seen_packets.add(packet_id)
-        return "flood"  # Special return value indicating flood to all neighbors except sender
-    
-    def get_next_hop(self, destination: str) -> Optional[str]:
-        return "flood"  # Always flood
-    
-    def update_neighbor(self, neighbor_id: str, neighbor_info: Dict):
-        self.neighbors[neighbor_id] = neighbor_info
-        # For flooding, we don't maintain a routing table - we always flood
-        print(f"🌊 Flooding: Added neighbor {neighbor_id}")
+    def update_neighbor(self, neighbor_id: str, info: dict):
+        """Keep neighbor list up to date"""
+        self.neighbors[neighbor_id] = info
+        # routing_table not needed for pure flooding, but keep interface
+        self.routing_table[neighbor_id] = neighbor_id
 
+    def process_packet(self, packet: Packet, from_neighbor_id: str) -> Optional[str]:
+        """
+        Decide what to do with an incoming packet.
+        Return values:
+          - "flood": router should flood the packet to (all) neighbors (except sender)
+          - None: packet should NOT be forwarded (consume locally / drop)
+        Behavior:
+          - HELLO: do NOT retransmit (only local processing)
+          - INFO: retransmit (flood) but maintain headers rolling list and detect cycles
+          - MESSAGE destined to a particular node: for pure flooding, forward (flood) unless addressed to me
+        """
 
-def _ensure_msg_id(pkt: Packet) -> str:
-    """
-    Ensure the packet has a stable unique identifier at headers['msg_id'].
-    If headers are missing, they are created. Returns the msg_id string.
-    """
-    headers = getattr(pkt, "headers", None)
-    if not isinstance(headers, dict):
-        # create headers dict if missing
-        setattr(pkt, "headers", {})
-        headers = pkt.headers
-    mid = headers.get("msg_id")
-    if not mid:
-        mid = uuid.uuid4().hex
-        headers["msg_id"] = mid
-    return mid
+        # Normalize headers to a list
+        headers = packet.headers if isinstance(packet.headers, list) else []
 
+        # 1) HELLO = neighbor introduction -> don't retransmit
+        if packet.type == "hello":
+            # Optionally register neighbor presence here (higher layers may do it)
+            return None
 
-def _mark_seen_LRU(mid: str, seen_ids: set, seen_fifo: deque, capacity: int) -> bool:
-    """
-    Record the id in a simple LRU cache (set + deque).
-    Returns True if this id was already seen (duplicate), False if it's new.
-    """
-    if mid in seen_ids:
-        return True
-    if len(seen_fifo) >= capacity:
-        old = seen_fifo.popleft()
-        seen_ids.discard(old)
-    seen_fifo.append(mid)
-    seen_ids.add(mid)
-    return False
+        # 2) INFO or broadcasted packets -> need to flood with headers management
+        if packet.to_addr in ["broadcast", "multicast"] or packet.type == "info":
+            # Cycle detection: if this router already appears in headers -> drop
+            if self.router_id in headers:
+                return None
+
+            # Maintain rolling window of last 3 routers:
+            # When forwarding, remove first element if >=3 and append our own id.
+            # (Router._process_packet should call decrement_ttl; still check TTL here)
+            if len(headers) >= 3:
+                headers.pop(0)
+            headers.append(self.router_id)
+            packet.headers = headers
+
+            # If TTL is exhausted, do not forward
+            if packet.ttl <= 0:
+                return None
+
+            return "flood"
+
+        # 3) MESSAGE directed at a single node:
+        # Flooding strategy: if not for this router, flood (best-effort).
+        if packet.type == "message":
+            if packet.to_addr == self.router_id:
+                return None
+            # update headers similarly for messages we forward so they can be loop-detected
+            if len(headers) >= 3:
+                headers.pop(0)
+            headers.append(self.router_id)
+            packet.headers = headers
+            if packet.ttl <= 0:
+                return None
+            return "flood"
+
+        # Default: don't forward
+        return None

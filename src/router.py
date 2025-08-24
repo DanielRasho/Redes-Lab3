@@ -43,9 +43,13 @@ class BaseRouter(ABC):
         
         # Logger for this router
         # Configure logger with console + file handlers
+        # Logger for this router
         self.logger = logging.getLogger(f"Router-{router_id}")
-
         self.logger.setLevel(logging.DEBUG)
+
+        # 🔑 Limpia handlers previos (incluido el que mete main.py)
+        if self.logger.hasHandlers():
+            self.logger.handlers.clear()
 
         # Console handler (only warnings and errors)
         console_handler = logging.StreamHandler()
@@ -60,14 +64,10 @@ class BaseRouter(ABC):
         console_handler.setFormatter(formatter)
         file_handler.setFormatter(formatter)
 
-        # Attach handlers (avoid duplicates if reinit)
-        if not self.logger.handlers:
-            self.logger.addHandler(console_handler)
-            self.logger.addHandler(file_handler)
+        # Attach handlers
+        self.logger.addHandler(console_handler)
+        self.logger.addHandler(file_handler)
 
-        
-        # Packet logging
-        self.packet_log = []
     
     def _create_routing_algorithm(self, algorithm: str) -> RoutingAlgorithm:
         """Factory method to create routing algorithm instance"""

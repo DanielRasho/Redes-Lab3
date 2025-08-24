@@ -90,98 +90,98 @@ class BaseRouter(ABC):
         """Load node address mappings from JSON file (implementation specific)"""
         pass
     
-def _process_packet(self, packet: Packet, from_neighbor_id: Optional[str] = None):
-    """Process an incoming packet.
+    def _process_packet(self, packet: Packet, from_neighbor_id: Optional[str] = None):
+        """Process an incoming packet.
 
-    from_neighbor_id: optional neighbor id string (not a socket). When flooding we map it to a socket
-    to exclude the sender from retransmission.
-    """
-    # Duplicate detection
-    if self._mark_rx_seen(packet):
-        self.logger.debug(f"[DUPLICATE] Packet already seen, dropping")
-        return
+        from_neighbor_id: optional neighbor id string (not a socket). When flooding we map it to a socket
+        to exclude the sender from retransmission.
+        """
+        # Duplicate detection
+        if self._mark_rx_seen(packet):
+            self.logger.debug(f"[DUPLICATE] Packet already seen, dropping")
+            return
 
-    # Allow routing algorithm to do protocol-specific processing if needed
-    if packet.proto == "flooding":
-        # flooding algorithm may keep its own state — nothing to do here by default
-        pass
+        # Allow routing algorithm to do protocol-specific processing if needed
+        if packet.proto == "flooding":
+            # flooding algorithm may keep its own state — nothing to do here by default
+            pass
 
-    # --- Broadcast / Multicast handling (multi-hop protocols like LSR may request forwarding) ---
-    if packet.to_addr in ["broadcast", "multicast"]:
-        neighbor_hint = from_neighbor_id if from_neighbor_id else "unknown"
-        decision = self.routing_algorithm.process_packet(packet, neighbor_hint)
+        # --- Broadcast / Multicast handling (multi-hop protocols like LSR may request forwarding) ---
+        if packet.to_addr in ["broadcast", "multicast"]:
+            neighbor_hint = from_neighbor_id if from_neighbor_id else "unknown"
+            decision = self.routing_algorithm.process_packet(packet, neighbor_hint)
 
-        # If algorithm returned None, for broadcast we interpret that as "flood"
-        if decision is None:
-            if packet.type == "hello":
-                # HELLO must NOT be retransmitted.
+            # If algorithm returned None, for broadcast we interpret that as "flood"
+            if decision is None:
+                if packet.type == "hello":
+                    # HELLO must NOT be retransmitted.
+                    return
+                decision = "flood"
+
+            # Map neighbor id -> socket to pass to flood helpers (they expect socket to exclude)
+            exclude_socket = self.active_connections.get(from_neighbor_id) if from_neighbor_id else None
+
+            if decision == "flood":
+                # Decrement TTL for multi-hop broadcast forward
+                if not packet.decrement_ttl():
+                    self.logger.warning(f"[DROPPED] Broadcast TTL expired")
+                    return
+                self._flood_packet(packet, exclude_socket)
                 return
-            decision = "flood"
 
-        # Map neighbor id -> socket to pass to flood helpers (they expect socket to exclude)
+            if decision == "flood_lsa":
+                if not packet.decrement_ttl():
+                    self.logger.warning(f"[DROPPED] LSA TTL expired")
+                    return
+                self._flood_packet_except_sender(packet, exclude_socket)
+                return
+
+            # If decision was something else (e.g., a specific neighbor), let it fall through
+            # to the unicast forwarding logic below.
+
+        # --- If packet is addressed to this router ---
+        if packet.to_addr == self.router_id:
+            if packet.type == "message":
+                self.logger.info(f"Message received: {packet.payload}")
+                print(f"\n{Colors.GREEN}[MESSAGE FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
+            elif packet.type == "echo":
+                # send echo reply
+                reply = Packet(
+                    proto=packet.proto,
+                    packet_type="echo_reply",
+                    from_addr=self.router_id,
+                    to_addr=packet.from_addr,
+                    ttl=5,
+                    headers=[self.router_id],
+                    payload=f"Echo reply from {self.router_id}"
+                )
+                self._forward_packet(reply)
+            elif packet.type == "echo_reply":
+                print(f"\n{Colors.BLUE}[ECHO REPLY FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
+            return
+
+        # --- Unicast forwarding ---
+        # Decrement TTL now for unicast forwarding and drop if expired
+        if not packet.decrement_ttl():
+            self.logger.warning(f"[DROPPED] Packet TTL expired")
+            return
+
+        # Ask routing algorithm for next hop. Provide neighbor hint if available.
+        neighbor_hint = from_neighbor_id if from_neighbor_id else "unknown"
+        next_hop = self.routing_algorithm.process_packet(packet, neighbor_hint)
+
+        # If algorithm explicitly requested flooding for a unicast (rare), map neighbor id -> socket
         exclude_socket = self.active_connections.get(from_neighbor_id) if from_neighbor_id else None
 
-        if decision == "flood":
-            # Decrement TTL for multi-hop broadcast forward
-            if not packet.decrement_ttl():
-                self.logger.warning(f"[DROPPED] Broadcast TTL expired")
-                return
+        if next_hop == "flood":
             self._flood_packet(packet, exclude_socket)
-            return
-
-        if decision == "flood_lsa":
-            if not packet.decrement_ttl():
-                self.logger.warning(f"[DROPPED] LSA TTL expired")
-                return
+        elif next_hop == "flood_lsa":
             self._flood_packet_except_sender(packet, exclude_socket)
-            return
-
-        # If decision was something else (e.g., a specific neighbor), let it fall through
-        # to the unicast forwarding logic below.
-
-    # --- If packet is addressed to this router ---
-    if packet.to_addr == self.router_id:
-        if packet.type == "message":
-            self.logger.info(f"Message received: {packet.payload}")
-            print(f"\n{Colors.GREEN}[MESSAGE FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
-        elif packet.type == "echo":
-            # send echo reply
-            reply = Packet(
-                proto=packet.proto,
-                packet_type="echo_reply",
-                from_addr=self.router_id,
-                to_addr=packet.from_addr,
-                ttl=5,
-                headers=[self.router_id],
-                payload=f"Echo reply from {self.router_id}"
-            )
-            self._forward_packet(reply)
-        elif packet.type == "echo_reply":
-            print(f"\n{Colors.BLUE}[ECHO REPLY FROM {packet.from_addr}]: {packet.payload}{Colors.ENDC}")
-        return
-
-    # --- Unicast forwarding ---
-    # Decrement TTL now for unicast forwarding and drop if expired
-    if not packet.decrement_ttl():
-        self.logger.warning(f"[DROPPED] Packet TTL expired")
-        return
-
-    # Ask routing algorithm for next hop. Provide neighbor hint if available.
-    neighbor_hint = from_neighbor_id if from_neighbor_id else "unknown"
-    next_hop = self.routing_algorithm.process_packet(packet, neighbor_hint)
-
-    # If algorithm explicitly requested flooding for a unicast (rare), map neighbor id -> socket
-    exclude_socket = self.active_connections.get(from_neighbor_id) if from_neighbor_id else None
-
-    if next_hop == "flood":
-        self._flood_packet(packet, exclude_socket)
-    elif next_hop == "flood_lsa":
-        self._flood_packet_except_sender(packet, exclude_socket)
-    elif next_hop:
-        # next_hop is expected to be a neighbor id
-        self._send_to_neighbor(packet, next_hop)
-    else:
-        self.logger.warning(f"[DROPPED] No route to destination {packet.to_addr}")
+        elif next_hop:
+            # next_hop is expected to be a neighbor id
+            self._send_to_neighbor(packet, next_hop)
+        else:
+            self.logger.warning(f"[DROPPED] No route to destination {packet.to_addr}")
 
     
     @abstractmethod
@@ -758,6 +758,52 @@ class RedisRouter(BaseRouter):
         self.user_input_task = None
         self.periodic_task = None
         self.event_loop = None
+        self.packet_log = []          # para mostrar "logs" en el CLI
+        self._rx_seen_ids = set()     # deduplicación (si ya lo agregaste, deja igual)
+        self._rx_seen_fifo = deque()
+        self._rx_seen_capacity = 50000
+
+    def _log_packet(self, action: str, packet, neighbor: str = None):
+        """Uniform packet activity log (mirrors Socket router)."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        neighbor_info = f" via {neighbor}" if neighbor else ""
+        try:
+            mid = getattr(packet, "headers", {}).get("msg_id")
+        except Exception:
+            mid = None
+        mid_info = f" [id={mid}]" if mid else ""
+        log_entry = f"{timestamp} [{action}]{neighbor_info} {packet.type}{mid_info} from {packet.from_addr} to {packet.to_addr}"
+        self.packet_log.append(log_entry)
+        self.logger.info(log_entry)
+        if len(self.packet_log) > 100:
+            self.packet_log = self.packet_log[-100:]
+
+    @staticmethod
+    def _ensure_msg_id(packet):
+        """Ensure a stable unique id in packet.headers['msg_id'] for duplicate filtering."""
+        if not getattr(packet, "headers", None) or not isinstance(packet.headers, dict):
+            packet.headers = {}
+        if "msg_id" not in packet.headers:
+            packet.headers["msg_id"] = uuid.uuid4().hex
+
+    def _mark_rx_seen(self, packet) -> bool:
+        """Return True if packet.headers['msg_id'] was already seen (duplicate)."""
+        try:
+            mid = packet.headers.get("msg_id")
+        except Exception:
+            mid = None
+        if not mid:
+            return False
+        if mid in self._rx_seen_ids:
+            return True
+        if len(self._rx_seen_fifo) >= self._rx_seen_capacity:
+            old = self._rx_seen_fifo.popleft()
+            self._rx_seen_ids.discard(old)
+        self._rx_seen_fifo.append(mid)
+        self._rx_seen_ids.add(mid)
+        return False
+
+
     
     def load_node_channels(self, names_file: str):
         """Load node channel mappings from Redis names JSON file"""

@@ -42,7 +42,29 @@ class BaseRouter(ABC):
         self.routing_algorithm = self._create_routing_algorithm(algorithm)
         
         # Logger for this router
+        # Configure logger with console + file handlers
         self.logger = logging.getLogger(f"Router-{router_id}")
+
+        self.logger.setLevel(logging.DEBUG)
+
+        # Console handler (only warnings and errors)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+
+        # File handler (everything goes to file)
+        file_handler = logging.FileHandler(f"router_{router_id}.log", mode="w")
+        file_handler.setLevel(logging.DEBUG)
+
+        # Formatter for both
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        console_handler.setFormatter(formatter)
+        file_handler.setFormatter(formatter)
+
+        # Attach handlers (avoid duplicates if reinit)
+        if not self.logger.handlers:
+            self.logger.addHandler(console_handler)
+            self.logger.addHandler(file_handler)
+
         
         # Packet logging
         self.packet_log = []

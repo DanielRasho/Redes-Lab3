@@ -17,6 +17,14 @@ class FloodingAlgorithm(RoutingAlgorithm):
 
     def get_name(self) -> str:
         return "flooding"
+    
+    def get_next_hop(self, destination: str) -> Optional[str]:
+        """
+        Flooding does not choose a single next hop for unicast destinations.
+        Return the sentinel "flood" to instruct Router to use its flooding logic.
+        """
+        return "flood"
+
 
     def update_neighbor(self, neighbor_id: str, info: dict):
         """Keep neighbor list up to date"""
@@ -36,8 +44,8 @@ class FloodingAlgorithm(RoutingAlgorithm):
           - MESSAGE destined to a particular node: for pure flooding, forward (flood) unless addressed to me
         """
 
-        # Normalize headers to a list
-        headers = packet.headers if isinstance(packet.headers, list) else []
+        # Access path in headers in a safe way
+        headers_path = packet.get_path()  # always returns list
 
         # 1) HELLO = neighbor introduction -> don't retransmit
         if packet.type == "hello":
@@ -47,18 +55,18 @@ class FloodingAlgorithm(RoutingAlgorithm):
         # 2) INFO or broadcasted packets -> need to flood with headers management
         if packet.to_addr in ["broadcast", "multicast"] or packet.type == "info":
             # Cycle detection: if this router already appears in headers -> drop
-            if self.router_id in headers:
+            if self.router_id in headers_path:
                 return None
 
             # Maintain rolling window of last 3 routers:
             # When forwarding, remove first element if >=3 and append our own id.
-            # (Router._process_packet should call decrement_ttl; still check TTL here)
-            if len(headers) >= 3:
-                headers.pop(0)
-            headers.append(self.router_id)
-            packet.headers = headers
+            new_path = list(headers_path)
+            if len(new_path) >= 3:
+                new_path.pop(0)
+            new_path.append(self.router_id)
+            packet.set_path(new_path)
 
-            # If TTL is exhausted, do not forward
+            # TTL should be checked/handled by caller (router) before actually sending.
             if packet.ttl <= 0:
                 return None
 
@@ -69,11 +77,11 @@ class FloodingAlgorithm(RoutingAlgorithm):
         if packet.type == "message":
             if packet.to_addr == self.router_id:
                 return None
-            # update headers similarly for messages we forward so they can be loop-detected
-            if len(headers) >= 3:
-                headers.pop(0)
-            headers.append(self.router_id)
-            packet.headers = headers
+            new_path = list(headers_path)
+            if len(new_path) >= 3:
+                new_path.pop(0)
+            new_path.append(self.router_id)
+            packet.set_path(new_path)
             if packet.ttl <= 0:
                 return None
             return "flood"

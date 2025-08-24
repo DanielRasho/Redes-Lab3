@@ -1,0 +1,10 @@
+{
+  "type": "names",
+  "host": "192.168.0.27",
+  "port": 6379,
+  "pwd": "",
+  "config": {
+    "A": { "channel": "router:A" },
+    "B": { "channel": "router:B" }
+  }
+}

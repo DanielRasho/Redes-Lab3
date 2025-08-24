@@ -1,20 +1,16 @@
+# packet.py
 import json
+import uuid
 from typing import Dict, List, Optional, Any, Union
 
-
 class Packet:
-    """Represents a network packet following the specified JSON pattern
-
-    Fields JSON:
-      - proto: str
-      - type: str
-      - from: str
-      - to: str
-      - ttl: int
-      - headers: List[str]
-      - payload: str | dict | any JSON-serializable
     """
+    Packet representation compatible with two header styles:
+      - legacy: headers = ["A","B","C"]   (used by flooding for path)
+      - extended: headers = {"msg_id": "...", "path": ["A","B","C"], ...}
 
+    Provides convenience methods so other modules don't need to branch.
+    """
     def __init__(
         self,
         proto: str,
@@ -22,77 +18,97 @@ class Packet:
         from_addr: str,
         to_addr: str,
         ttl: int = 5,
-        headers: Optional[List[str]] = None,
-        payload: Union[str, Dict[str, Any], List[Any], int, float, None] = "",
+        headers: Optional[Union[List[str], Dict[str, Any]]] = None,
+        payload: Any = ""
     ):
-        self.proto: str = proto
-        self.type: str = packet_type
-        self.from_addr: str = from_addr
-        self.to_addr: str = to_addr
-        self.ttl: int = int(ttl)
-        # headers debe ser una lista de strings según el protocolo ["A","B","C"]
-        self.headers: List[str] = headers[:] if headers else []
-        self.payload: Union[str, Dict[str, Any], List[Any], int, float, None] = payload
+        self.proto = proto
+        self.type = packet_type
+        self.from_addr = from_addr
+        self.to_addr = to_addr
+        self.ttl = ttl
+        # Accept list or dict; keep as-is for backwards compatibility
+        self.headers: Union[List[str], Dict[str, Any]]
+        if headers is None:
+            self.headers = []
+        else:
+            self.headers = headers
+        self.payload = payload
 
-        if not isinstance(self.headers, list):
-            raise TypeError("headers must be a list of strings")
-        for h in self.headers:
-            if not isinstance(h, str):
-                raise TypeError("each header entry must be a string")
+    # --- convenience helpers for header handling ----
+    def _is_headers_dict(self) -> bool:
+        return isinstance(self.headers, dict)
+
+    def get_msg_id(self) -> Optional[str]:
+        """Return the msg_id if present, otherwise None"""
+        if self._is_headers_dict():
+            return self.headers.get("msg_id")
+        return None
+
+    def ensure_msg_id(self) -> str:
+        """
+        Ensure there's a stable unique id stored in headers['msg_id'].
+        If headers was a list, convert to dict preserving 'path'.
+        Returns the msg_id.
+        """
+        mid = self.get_msg_id()
+        if mid:
+            return mid
+
+        new_id = uuid.uuid4().hex
+        if self._is_headers_dict():
+            self.headers["msg_id"] = new_id
+        else:
+            # convert list -> dict preserving path
+            path = list(self.headers) if isinstance(self.headers, list) else []
+            self.headers = {"path": path, "msg_id": new_id}
+        return new_id
+
+    def get_path(self) -> List[str]:
+        """Return headers path as a list of node ids (empty list if none)"""
+        if self._is_headers_dict():
+            return list(self.headers.get("path", []))
+        if isinstance(self.headers, list):
+            return list(self.headers)
+        return []
+
+    def set_path(self, path: List[str]):
+        """Set/update path preserving header shape (dict or list)"""
+        if self._is_headers_dict():
+            self.headers["path"] = list(path)
+        else:
+            self.headers = list(path)
 
     def to_json(self) -> str:
-        """Serializa el paquete a una cadena JSON."""
-        obj = {
+        """Serialize to JSON string"""
+        return json.dumps({
             "proto": self.proto,
             "type": self.type,
             "from": self.from_addr,
             "to": self.to_addr,
             "ttl": self.ttl,
             "headers": self.headers,
-            "payload": self.payload,
-        }
-        # json.dumps must be serializable;
-        return json.dumps(obj, ensure_ascii=False)
+            "payload": self.payload
+        })
 
     @classmethod
     def from_json(cls, json_str: str) -> "Packet":
-        """Build a Packet from a JSON string."""
+        """Construct Packet from JSON string"""
         data = json.loads(json_str)
-        proto = data.get("proto")
-        packet_type = data.get("type")
-        from_addr = data.get("from")
-        to_addr = data.get("to")
-        ttl = data.get("ttl", 5)
-        headers = data.get("headers", [])
-        payload = data.get("payload", "")
-
-        if headers is None:
-            headers = []
-        if not isinstance(headers, list):
-            raise TypeError("headers must be a list of strings")
-
-        # Build Packet
         return cls(
-            proto=proto,
-            packet_type=packet_type,
-            from_addr=from_addr,
-            to_addr=to_addr,
-            ttl=ttl,
-            headers=headers,
-            payload=payload,
+            proto=data["proto"],
+            packet_type=data["type"],
+            from_addr=data["from"],
+            to_addr=data["to"],
+            ttl=data.get("ttl", 5),
+            headers=data.get("headers", []),
+            payload=data.get("payload", "")
         )
 
     def decrement_ttl(self) -> bool:
-        """Decreases TTL by 1 and returns True if the packet is still valid (>0)."""
-        try:
-            self.ttl = int(self.ttl) - 1
-        except Exception:
-            # If ttl is not convertible, we force it to 0 and consider it invalid.
-            self.ttl = 0
+        """Decrement TTL by one. Return True if still > 0 after decrement."""
+        self.ttl -= 1
         return self.ttl > 0
 
-    def __repr__(self) -> str:
-        return (
-            f"Packet(proto={self.proto!r}, type={self.type!r}, from={self.from_addr!r}, "
-            f"to={self.to_addr!r}, ttl={self.ttl!r}, headers={self.headers!r}, payload={self.payload!r})"
-        )
+    # nice repr for debugging
+    def __repr__(self):
+        return f"Packet(proto={self.proto}, type={self.type}, from={self.from_addr}, to={self.to_addr}, ttl={self.ttl}, headers={self.headers})"

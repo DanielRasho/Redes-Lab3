@@ -2,7 +2,7 @@
 
 ## Dependencies
 
-```
+```bash
 pip install redis
 ```
 

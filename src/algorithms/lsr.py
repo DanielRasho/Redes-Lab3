@@ -381,3 +381,51 @@ class LinkStateRouting(RoutingAlgorithm):
         if cand_nb != cur_nb:
             return cand_nb
         return cand < cur
+
+    # === Helpers ===
+
+    def firstHop(self, dst: str, prev: Dict[str, Optional[str]]) -> Optional[str]:
+        """
+        Obtiene el primer salto desde self.router_id hacia dst recorriendo 'prev'.
+        """
+        cur = dst
+        steps = 0
+        while prev.get(cur) is not None and prev[cur] != self.router_id:
+            cur = prev[cur]
+            steps += 1
+            if steps > 1024:  # protección
+                return None
+        if prev.get(cur) == self.router_id:
+            return cur
+        # vecino directo
+        if dst in self.neighbor_states and self.neighbor_states[dst].get("alive", False):
+            return dst
+        return None
+
+    def handleHeadersPath(self, packet: Packet) -> bool:
+        """
+        Mantiene headers.path como ventana de 3 nodos y corta ciclos.
+        True  -> seguro continuar
+        False -> ciclo detectado o path inválido (drop)
+        """
+        try:
+            path = packet.get_path()  # siempre list (internamente maneja dict/list)
+        except Exception:
+            path = []
+
+        # ciclo: si ya pasé por aquí, no reenvío
+        if self.router_id in path:
+            return False
+
+        # ventana de 3: quita primero si ya hay 3 y agrega mi id
+        new_path = list(path)
+        if len(new_path) >= 3:
+            new_path.pop(0)
+        new_path.append(self.router_id)
+
+        try:
+            packet.set_path(new_path)
+        except Exception:
+            return False
+
+        return True

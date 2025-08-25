@@ -659,3 +659,95 @@ Sólo cuando `alt == dist[v]` en Dijkstra (empate en costo total). Aporta **esta
 - **LSAs** recibidos/emitidos pueblan/eliminan aristas “remotas”.
 - **Timers** (`_check_neighbor_timeouts`, `_age_lsa_database`) gatillan `topology_changed`; el bucle principal, vía `should_send_lsa()`, puede emitir nuevos LSAs tras cambios significativos.
 - **Reenvío**: `get_next_hop(dest)` consulta `self.routing_table` para decidir el vecino siguiente.
+
+## Helpers
+
+### `firstHop(dst: str, prev: Dict[str, Optional[str]]) -> Optional[str]`
+
+**Propósito**
+Obtener el **primer salto** desde `self.router_id` hacia `dst` recorriendo el mapa de **predecesores** `prev` (típico de Dijkstra si se guarda `prev[nodo] = padre`).
+
+**Parámetros**
+
+- `dst`: destino al que se quiere reenviar.
+- `prev`: diccionario `nodo -> predecesor` (o `None` si es el origen).
+
+**Retorno**
+
+- `str` con el **vecino next-hop** si existe ruta.
+- `None` si no hay ruta determinable.
+
+**Algoritmo / Flujo**
+
+1. Parte en `cur = dst` y camina hacia atrás por `prev[cur]` hasta:
+
+   - Encontrar que `prev[cur] == self.router_id` → el **primer salto** es `cur`.
+   - Encontrar `prev[cur] is None` (o falta de clave) → no hay ruta completa.
+2. **Protección** anti-bucles: corta si se superan **1024** pasos.
+3. Si no se pudo reconstruir pero `dst` es **vecino directo vivo**, retorna `dst`.
+4. En otro caso, retorna `None`.
+
+**Complejidad**
+
+- `O(h)` donde `h` es la longitud del camino (acotado por 1024 para seguridad).
+
+**Errores / Edge cases**
+
+- Usa `prev.get(...)` para evitar `KeyError`.
+- Si `prev` está incompleto o hay ciclo en `prev`, devuelve `None` por el límite de pasos.
+
+**Relación con otras partes**
+
+- Es una utilidad genérica para reconstrucción de **first-hop** a partir de un `prev`.
+  En esta implementación, el SPF actual calcula el first-hop **durante la relajación** (ver `calculateRoutes()`), por lo que `firstHop()` queda como helper alternativo/legado.
+
+### `handleHeadersPath(packet: Packet) -> bool`
+
+**Propósito**
+Mantener y validar `headers.path` como una **ventana deslizante de 3 nodos** para:
+
+- Detectar y **cortar ciclos** locales.
+- Anotar el paso del paquete por este router.
+
+**Parámetros**
+
+- `packet`: instancia de `Packet` a inspeccionar y actualizar.
+
+**Retorno**
+
+- `True` si es seguro continuar (path actualizado).
+- `False` si se detecta **ciclo** o el `path` es inválido/no actualizable.
+
+**Algoritmo / Flujo**
+
+1. Obtiene la ruta actual con `packet.get_path()`; si falla, asume `[]`.
+2. **Anti-loop local**: si `self.router_id` **ya está** en `path`, retorna `False` (drop).
+3. Crea `new_path`:
+
+   - Si `len(new_path) >= 3`, **pop(0)** para mantener ventana de 3.
+   - `append(self.router_id)` para registrar el tránsito.
+4. Intenta persistir con `packet.set_path(new_path)`.
+   Si hay excepción → `False`.
+5. Si todo va bien → `True`.
+
+**Complejidad**
+
+- `O(1)` amortizado; la lista nunca supera **3** elementos.
+
+**Errores / Edge cases**
+
+- Maneja silenciosamente `get_path()` inválido iniciando con `[]`.
+- Si `set_path()` falla (p. ej., headers no mutables), retorna `False`.
+
+**Relación con otras partes**
+
+- Se invoca en `process_packet()` para **LSA/INFO** antes de aceptar/floodear el anuncio.
+- Complementa el control de bucles junto con:
+
+  - `ttl` (controlado por `router.py` en el **flood**).
+  - Filtro de **duplicados** (`lsa_seen`/`lsa_fifo`) que evita re-procesar LSAs ya vistos.
+
+**Notas de diseño**
+
+- La ventana corta (3) equilibra coste y utilidad: suficiente para detectar **loops inmediatos** sin inflar headers.
+- No es un mecanismo criptográfico; evita reenvíos triviales cíclicos en el plano de **control**.

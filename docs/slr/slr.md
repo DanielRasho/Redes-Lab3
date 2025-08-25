@@ -430,3 +430,118 @@ Estas funciones permiten a `router.py` decidir **cuándo** emitir mensajes de pr
 - El **payload** `INFO` y los **headers** están alineados con `process_packet()`:
 
   - `process_packet()` valida `origin == from_addr`, deduplica por `(origin, seq)`, y al aceptar dispara SPF y retorna `"flood_lsa"`.
+
+## Mantenimiento: timeouts de vecinos y envejecimiento de LSAs
+
+Estas funciones mantienen coherente el **estado local** del enrutador cuando no hay tráfico suficiente para refrescarlo continuamente. Ambas son **idempotentes**, **thread-safe** (usan `self._lock`) y, si detectan cambios, **disparan recalculo SPF** y marcan `topology_changed = True`, lo que habilita la emisión de un nuevo LSA según `should_send_lsa()`.
+
+### `_check_neighbor_timeouts() -> None`
+
+**Propósito:**
+Actualizar el flag `alive` de cada vecino en `neighbor_states` comparando el `last_seen` con `NEIGHBOR_TIMEOUT`.
+
+**Entrada / Parámetros:**
+*No recibe parámetros.* Usa:
+
+- `self.NEIGHBOR_TIMEOUT` (segundos)
+- `self.neighbor_states[nb] = {"last_seen", "alive", "cost", ...}`
+
+**Salida / Retorno:**
+`None`.
+
+**Efectos de estado:**
+
+- Para cada vecino `nb`:
+
+  - Calcula `alive_now = (now - last_seen) < NEIGHBOR_TIMEOUT`.
+  - Si `alive_now` difiere de `st["alive"]`, actualiza `st["alive"]` y marca `changed = True`.
+- Si `changed`:
+
+  - `self.topology_changed = True`
+  - `self.calculateRoutes()` (SPF inmediato)
+
+**Flujo (alto nivel):**
+
+1. Lee `now = time.time()`.
+2. Bajo `_lock`, recorre `neighbor_states` y actualiza `alive`.
+3. Si hubo cambios, marca topología cambiada y corre SPF.
+
+**Relación con otras partes:**
+
+- `process_packet(HELLO)` y `update_neighbor()` refrescan `last_seen`; esta rutina “apaga” vecinos que **no** se refrescaron a tiempo.
+- `create_lsa_packet()` solo anuncia como vecinos los **vivos** dentro de la ventana → un vecino marcado como no vivo dejará de aparecer en el LSA propio.
+- Al poner `topology_changed = True`, `should_send_lsa()` podrá autorizar un LSA “rápido” (respetando `LSA_MIN_INTERVAL`).
+
+**Complejidad:** `O(|neighbors|)`.
+
+**Consideraciones:**
+
+- No elimina entradas; solo conmuta `alive`. La eliminación (si se desea) es una decisión de diseño separada.
+- Usa `time.time()` (no monotónico); si el reloj del sistema retrocede, los cálculos podrían verse afectados.
+
+### `_age_lsa_database() -> None`
+
+**Propósito:**
+Retirar de `link_state_db` aquellas LSAs cuya marca `last_received` excede `LSA_MAX_AGE`.
+
+**Entrada / Parámetros:**
+*No recibe parámetros.* Usa:
+
+- `self.LSA_MAX_AGE` (segundos)
+- `self.link_state_db[origin] = {"seq", "neighbors", "last_received"}`
+
+**Salida / Retorno:**
+`None`.
+
+**Efectos de estado:**
+
+- Bajo `_lock`, elimina `link_state_db[origin]` si `now - last_received >= LSA_MAX_AGE`.
+- Si se eliminó al menos una entrada:
+
+  - `self.topology_changed = True`
+  - `self.calculateRoutes()` (SPF inmediato)
+
+**Flujo (alto nivel):**
+
+1. Lee `now = time.time()`.
+2. Bajo `_lock`, itera `link_state_db` (en copia `list(...)` para permitir `del`).
+3. Borra LSAs vencidas y, si hubo cambios, marca y recalcula.
+
+**Relación con otras partes:**
+
+- Mantiene limpia la LSDB ante routers que dejaron de anunciarse.
+- Al limpiar LSAs, cambia la topología efectiva → recalcula SPF y habilita (vía `topology_changed`) un nuevo LSA propio cuando `should_send_lsa()` lo permita.
+- No toca el filtro de duplicados `lsa_seen` (que se limpia por FIFO en otros flujos).
+
+**Complejidad:** `O(|LSDB|)`.
+
+**Consideraciones:**
+
+- Puede expulsar incluso el LSA propio si no se ha refrescado (debería prevenirse por `LSA_REFRESH_INTERVAL` en `should_send_lsa()` + `create_lsa_packet()`).
+- El borrado puede provocar particiones visibles en rutas inmediatamente tras el SPF.
+
+### Integración sugerida (ciclo de mantenimiento)
+
+En el bucle principal del router (o en un *ticker* periódico):
+
+```python
+# pseudocódigo de servicio cada ~1s (o acorde a tus necesidades)
+algo._check_neighbor_timeouts()
+algo._age_lsa_database()
+
+if algo.should_send_hello():
+    pkt = algo.create_hello_packet()
+    send(pkt)  # broadcast sin retransmisión
+
+if algo.should_send_lsa():
+    pkt = algo.create_lsa_packet()
+    send(pkt)  # broadcast; el router hará flood controlado
+```
+
+**Frecuencia típica:** 500–1000 ms es suficiente; ambas rutinas son `O(n)` y baratas para topologías pequeñas/medianas.
+
+### Contratos e invariantes
+
+- **Thread-safety:** Ambas funciones toman `self._lock` para evitar carreras con `process_packet()` y `create_lsa_packet()`.
+- **Consistencia SPF:** Cualquier cambio topológico local (vecino que “muere”/“resucita” o LSA que expira) **siempre** provoca un SPF inmediato.
+- **Emisión LSA:** La bandera `topology_changed` es el gatillo que `should_send_lsa()` observa, amortiguado por `LSA_MIN_INTERVAL`.

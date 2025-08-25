@@ -265,3 +265,40 @@ class LinkStateRouting(RoutingAlgorithm):
             headers=headers,
             payload=json.dumps(payload)
         )
+
+    # ===== Mantenimientos periódicos =====
+
+    def _check_neighbor_timeouts(self):
+        """
+        Marca vecinos como vivos/muertos según NEIGHBOR_TIMEOUT.
+        Si cambia algo, recalcula rutas y marca topología cambiada.
+        """
+        now = time.time()
+        changed = False
+        with self._lock:
+            for nb, st in list(self.neighbor_states.items()):
+                last = st.get("last_seen", 0)
+                alive_now = (now - last) < self.NEIGHBOR_TIMEOUT
+                if alive_now != st.get("alive", False):
+                    st["alive"] = alive_now
+                    self.neighbor_states[nb] = st
+                    changed = True
+        if changed:
+            self.topology_changed = True
+            self.calculateRoutes()
+
+    def _age_lsa_database(self):
+        """
+        Envejece/retira LSAs viejas (LSA_MAX_AGE). Si cambia algo, recalcula rutas.
+        """
+        now = time.time()
+        removed = False
+        with self._lock:
+            for origin, entry in list(self.link_state_db.items()):
+                if (now - entry.get("last_received", 0)) >= self.LSA_MAX_AGE:
+                    del self.link_state_db[origin]
+                    removed = True
+        if removed:
+            self.topology_changed = True
+            self.calculateRoutes()
+

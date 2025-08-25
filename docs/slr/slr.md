@@ -545,3 +545,117 @@ if algo.should_send_lsa():
 - **Thread-safety:** Ambas funciones toman `self._lock` para evitar carreras con `process_packet()` y `create_lsa_packet()`.
 - **Consistencia SPF:** Cualquier cambio topológico local (vecino que “muere”/“resucita” o LSA que expira) **siempre** provoca un SPF inmediato.
 - **Emisión LSA:** La bandera `topology_changed` es el gatillo que `should_send_lsa()` observa, amortiguado por `LSA_MIN_INTERVAL`.
+
+## Cálculo de rutas (SPF/Dijkstra)
+
+### `calculateRoutes() -> None`
+
+**Propósito**
+Construir el grafo de la topología a partir de:
+
+- Vecinos directos **vivos** (`neighbor_states`)
+- LSAs vigentes en la **LSDB** (`link_state_db`)
+
+y ejecutar **Dijkstra** para obtener, para cada destino alcanzable, el **primer salto (first-hop)** desde `self.router_id`. La tabla resultante se guarda en `self.routing_table` como `{destino: vecino_next_hop}`.
+
+**Parámetros / Retorno**
+No recibe parámetros. Retorna `None`.
+Actualiza estado interno:
+
+- `self.area_routers`: conjunto de nodos presentes en el grafo.
+- `self.routing_table`: mapa destino → next-hop.
+
+**Sincronización**
+Toda la rutina corre bajo `self._lock` para evitar condiciones de carrera con:
+
+- `process_packet()` (ingreso de LSAs/HELLO)
+- `_check_neighbor_timeouts()` (cambios de vecinos vivos)
+- `_age_lsa_database()` (expiración de LSAs)
+- `create_lsa_packet()` (publicación del propio LSA)
+
+**Construcción del grafo (`adj`)**
+
+- Se usa `defaultdict(dict)` bidireccional (grafo no dirigido con costo entero positivo).
+- **Vecinos directos**: se agregan sólo si `alive == True`; costo por `st["cost"]`.
+- **LSAs**: para cada `origin` y su lista `neighbors`, se crean aristas en ambos sentidos.
+  Si ya existía una arista, se toma el **mínimo** costo observado (`min(prev, c)`) para robustez ante anuncios redundantes o asimetrías de entrada.
+
+**Dijkstra (determinista)**
+
+- Inicializa `dist[n] = ∞` y `first[n] = None`; `dist[src] = 0.0`.
+- Conjunto `unvisited` con todos los nodos del grafo.
+- Selección del próximo nodo `u`: `min(unvisited, key=(dist, nombre))` → desempate **determinista**.
+- Relajación para cada vecino `v` de `u` (iterados en orden alfabético para más determinismo):
+
+  - `alt = dist[u] + adj[u][v]`
+  - `cand_first = v si u == src else first[u]`
+    (Se “arrastra” el **primer salto** durante la relajación; evita reconstruir ruta al final).
+  - Actualiza `dist[v]` y `first[v]` si:
+
+    - `alt < dist[v]`, **o**
+    - `alt == dist[v]` y `preferFirstHop(cand_first, first[v])` es `True`.
+
+**Emisión de la FIB (tabla de reenvío)**
+
+- Para cada `dst` con `dist[dst] < ∞` y `first[dst]` no nulo:
+
+  - `new_table[dst] = first[dst]`
+- Asigna `self.routing_table = new_table`.
+  Si `src` no aparece en `adj` (sin vecinos/topología vacía), limpia la tabla.
+
+**Criterios de diseño / Invariantes**
+
+- **Determinismo**:
+
+  1. elección de `u` desempata por nombre;
+  2. vecinos de `u` se recorren ordenados;
+  3. igual costo desempata con `preferFirstHop()`.
+     Con esto se reduce el *route flapping* ante empates.
+- **Robustez**: el **first-hop** se fija durante la relajación; evita ambigüedades en la reconstrucción.
+- **Separación de responsabilidades**:
+
+  - La **vigencia** de vecinos la decide `_check_neighbor_timeouts()` y `HELLO`.
+  - La **vigencia** de LSAs la decide `_age_lsa_database()`.
+  - `calculateRoutes()` consume un grafo ya “higienizado”.
+
+**Complejidad**
+
+- Construcción del grafo: `O(E)`.
+- Dijkstra con selección por `min` lineal: `O(V^2 + E log 1)` ≈ `O(V^2 + E)` (sin heap).
+  Suficiente para topologías pequeñas/medianas típicas de laboratorio.
+  (Puede optimizarse con un heap si `V` crece).
+
+**Casos borde**
+
+- Topología desconectada: destinos con `dist = ∞` quedan **sin entrada** en `routing_table`.
+- Costos duplicados/contradictorios en LSAs: se toma el **mínimo** observado.
+- Sin vecinos vivos ni LSAs: `routing_table` se vacía.
+
+### `preferFirstHop(cand: Optional[str], cur: Optional[str]) -> bool`
+
+**Propósito**
+Desempatar **rutas de costo igual** eligiendo el **primer salto** más estable y predecible.
+
+**Reglas (en orden de prioridad)**
+
+1. **Preferir alguno** frente a ninguno:
+
+   - Si `cur is None` → `True` (acepta `cand`).
+   - Si `cand is None` → `False`.
+2. **Preferir vecinos directos vivos**:
+
+   - Si `cand` es vecino con `alive=True` y `cur` no lo es → `True`.
+   - Si `cur` es vivo y `cand` no → `False`.
+3. **Orden lexicográfico** del nombre del vecino (determinismo):
+
+   - Retorna `cand < cur`.
+
+**Cuándo se usa**
+Sólo cuando `alt == dist[v]` en Dijkstra (empate en costo total). Aporta **estabilidad** (elige nexthops activos) y **reproducibilidad** (mismo grafo ⇒ misma tabla).
+
+### Interacción con el resto del sistema
+
+- **HELLO/update\_neighbor** marcan y refrescan vecinos → afectan aristas “locales”.
+- **LSAs** recibidos/emitidos pueblan/eliminan aristas “remotas”.
+- **Timers** (`_check_neighbor_timeouts`, `_age_lsa_database`) gatillan `topology_changed`; el bucle principal, vía `should_send_lsa()`, puede emitir nuevos LSAs tras cambios significativos.
+- **Reenvío**: `get_next_hop(dest)` consulta `self.routing_table` para decidir el vecino siguiente.

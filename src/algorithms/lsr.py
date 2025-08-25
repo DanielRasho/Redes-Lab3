@@ -302,3 +302,82 @@ class LinkStateRouting(RoutingAlgorithm):
             self.topology_changed = True
             self.calculateRoutes()
 
+    # ===== SPF (Dijkstra) =====
+
+    def calculateRoutes(self):
+        """
+        Construye el grafo y corre SPF. Calcula el first-hop
+        durante la relajación (más robusto que reconstruir al final).
+        """
+        adj: Dict[str, Dict[str, int]] = defaultdict(dict)
+
+        with self._lock:
+            # 1) Vecinos directos vivos
+            for nb, st in self.neighbor_states.items():
+                if st.get("alive", False):
+                    c = int(st.get("cost", 1))
+                    adj[self.router_id][nb] = c
+                    adj[nb][self.router_id] = c
+
+            # 2) LSAs aprendidas (ya envejecidas por _age_lsa_database)
+            for origin, entry in self.link_state_db.items():
+                for nb, c in entry.get("neighbors", {}).items():
+                    c = int(c)
+                    prev = adj[origin].get(nb, c)
+                    adj[origin][nb] = min(prev, c)
+                    prev2 = adj[nb].get(origin, c)
+                    adj[nb][origin] = min(prev2, c)
+
+            self.area_routers = set(adj.keys())
+            src = self.router_id
+            if src not in adj:
+                self.routing_table.clear()
+                return
+
+            inf = float("inf")
+            dist: Dict[str, float] = {n: inf for n in adj.keys()}
+            first: Dict[str, Optional[str]] = {n: None for n in adj.keys()}
+            dist[src] = 0.0
+
+            unvisited = set(adj.keys())
+            while unvisited:
+                # desempate determinista
+                u = min(unvisited, key=lambda n: (dist.get(n, inf), n))
+                unvisited.remove(u)
+                if dist[u] == inf:
+                    break
+
+                for v in sorted(adj[u].keys()):
+                    if v not in unvisited:
+                        continue
+                    alt = dist[u] + adj[u][v]
+                    cand_first = v if u == src else first[u]
+
+                    if (alt < dist[v]) or (alt == dist[v] and self.preferFirstHop(cand_first, first[v])):
+                        dist[v] = alt
+                        first[v] = cand_first
+
+            new_table: Dict[str, str] = {}
+            for dst, fh in first.items():
+                if dst == src or fh is None or dist.get(dst, inf) == inf:
+                    continue
+                new_table[dst] = fh  # next-hop definitivo
+
+            self.routing_table = new_table
+
+    def preferFirstHop(self, cand: Optional[str], cur: Optional[str]) -> bool:
+        """
+        Criterio de desempate cuando dos rutas tienen igual costo:
+        1) Prefiere tener algún first-hop a no tener (None).
+        2) Prefiere vecinos directos vivos.
+        3) Desempata por nombre para determinismo.
+        """
+        if cur is None:
+            return True
+        if cand is None:
+            return False
+        cand_nb = cand in self.neighbor_states and self.neighbor_states[cand].get("alive", False)
+        cur_nb  = cur  in self.neighbor_states and self.neighbor_states[cur].get("alive", False)
+        if cand_nb != cur_nb:
+            return cand_nb
+        return cand < cur

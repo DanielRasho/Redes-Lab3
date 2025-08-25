@@ -1,4 +1,6 @@
-# LinkStateRouting — Estado base y constantes
+# Link State Routing
+
+## LinkStateRouting — Estado base y constantes
 
 ```python
 import json
@@ -11,11 +13,11 @@ from src.algorithms.base import RoutingAlgorithm
 from src.packet import Packet
 ```
 
-## Propósito del módulo
+### Propósito del módulo
 
 Implementa un algoritmo de **Link State Routing (LSR)** estilo OSPF simplificado, diseñado para un entorno **pub/sub** (e.g. Redis). Gestiona **descubrimiento de vecinos (HELLO)**, **difusión de LSAs (INFO)**, **cálculo SPF (Dijkstra)** y **control de flooding**/deduplicación, exponiendo una **tabla de encaminamiento** (next-hop por destino) que consumen capas superiores (p. ej., `router.py`).
 
-## Mensajería (convenciones)
+### Mensajería (convenciones)
 
 * `proto="lsr"`
 * `type`:
@@ -32,7 +34,7 @@ Implementa un algoritmo de **Link State Routing (LSR)** estilo OSPF simplificado
 > * `src.packet.Packet`: representación de paquetes que usa los headers anteriores.
 > * `router.py`: orquesta I/O pub/sub y decide retransmitir cuando el algoritmo retorna una acción tipo *flood LSA*.
 
-## Clase: `LinkStateRouting`
+### Clase: `LinkStateRouting`
 
 ```python
 class LinkStateRouting(RoutingAlgorithm):
@@ -59,7 +61,7 @@ LSA_MAX_AGE = 90.0            # Envejecimiento de entradas LSDB (expiración)
 * El LSA propio se emite **como mínimo** cada `LSA_MIN_INTERVAL` cuando hay cambios y se **refresca** cada `LSA_REFRESH_INTERVAL`.
 * LSAs antiguos se purgan al superar `LSA_MAX_AGE`.
 
-### Constructor
+#### Constructor
 
 ```python
 def __init__(self, router_id: str):
@@ -84,7 +86,7 @@ def __init__(self, router_id: str):
 
 * No lanza explícitamente; cualquier validación de `router_id` sucede en `RoutingAlgorithm`.
 
-### Atributos de estado (y su rol)
+#### Atributos de estado (y su rol)
 
 | Atributo           |                        Tipo | Descripción                                                        | Actualización típica                           | Consumido por                             |
 | ------------------ | --------------------------: | ------------------------------------------------------------------ | ---------------------------------------------- | ----------------------------------------- |
@@ -106,7 +108,7 @@ def __init__(self, router_id: str):
 * `lsa_seen` + `lsa_fifo` implementan una **LRU manual**: si el tamaño supera `lsa_capacity`, se popleft de la `deque` y se elimina la clave del `set`. Evita re-procesar/re-floodear LSAs duplicados.
 * `RLock` permite que callbacks internos reingresen secciones críticas sin deadlocks (útil cuando un evento dispara otro que vuelve a tocar el estado).
 
-## Flujo lógico (de alto nivel) cubierto por este fragmento
+### Flujo lógico (de alto nivel) cubierto por este fragmento
 
 1. **Inicialización**
    Se crea el contenedor de estado (vecinos, LSDB, dedupe) y se arman los **timers** de referencia (constantes).
@@ -126,9 +128,191 @@ def __init__(self, router_id: str):
 4. **Integración con router.py**
    Cuando este algoritmo **indica** “flood\_lsa” (en métodos no mostrados aún), `router.py` se encarga de publicar el LSA en broadcast y de **no** retransmitir `hello`.
 
-## Contratos y garantías
+### Contratos y garantías
 
 * **Thread-safety:** toda mutación de `neighbor_states`, `link_state_db`, `lsa_seen` y marcas de tiempo se debe hacer bajo `_lock`.
 * **Deduplicación fuerte:** `lsa_seen` asegura que un LSA con `(origin, seq)` no se procesa ni se vuelve a inundar.
 * **Rate-limiting de LSAs propios:** nunca se emite más frecuente que `LSA_MIN_INTERVAL`; siempre se renueva antes de `LSA_MAX_AGE` mediante `LSA_REFRESH_INTERVAL`.
 * **Reconvergencia:** cualquier cambio en vecinos/LSDB seta `topology_changed=True` para que el **SPF** recalcule la **routing\_table** (implementación en métodos posteriores).
+
+## API requerida por `routes.py`
+
+Esta sección expone los métodos que `router.py` invoca para integrar el algoritmo LSR con la capa de I/O pub/sub.
+
+### `get_name() -> str`
+
+**Propósito:** Identifica el protocolo para `router.py`.
+
+* **Retorna:** `"lsr"`.
+* **Uso típico:** `router.py` puede anunciar/registrar el algoritmo activo o enrutar por nombre de protocolo.
+
+### `update_neighbor(neighbor_id: str, neighbor_info: Dict) -> None`
+
+**Propósito:** Crear/actualizar el estado de un **vecino directo** (costo, vida, timestamps) a partir de metadatos que conoce `router.py` (canal físico/lógico, costo, etc.).
+
+**Parámetros**
+
+* `neighbor_id`: identificador único del vecino directo.
+* `neighbor_info`: diccionario que puede incluir:
+
+  * `cost: int` (opcional; por defecto `1`)
+  * otros metadatos ignorados por el núcleo LSR (p. ej. canal).
+
+**Efectos/estado**
+
+* Bajo `_lock`:
+
+  * Actualiza `neighbor_states[neighbor_id] = {cost, last_seen=now, alive=True}`.
+  * Actualiza `self.neighbors[neighbor_id] = {"cost": cost}` (tabla mínima de adyacencia directa; suele venir de la clase base).
+  * Marca `topology_changed = True` para disparar recálculo SPF en el ciclo correspondiente.
+* **No** envía mensajes de red ni recalcula rutas de inmediato (a menos que otra parte llame a `calculateRoutes()`).
+
+**Retorna:** `None`.
+
+**Relación con otras partes**
+
+* `router.py` debería llamar a este método cuando:
+
+  * se descubre un enlace/vecino,
+  * cambia el costo del enlace,
+  * o se quiere “revivir” un vecino tras reconexión.
+
+### `process_packet(packet: Packet, from_neighbor: str) -> Optional[str]`
+
+**Propósito:** Consumir/interpretar un paquete entrante y devolver la **acción de reenvío** apropiada para que `router.py` la ejecute.
+
+**Parámetros**
+
+* `packet`: instancia de `Packet` con al menos:
+
+  * `type`: `"hello" | "lsa"/"info" | "message"/"echo"`
+  * `from_addr`, `to_addr`, `payload` (JSON para LSA), `headers` (con `path`, `msg_id`, etc.)
+  * método `ensure_msg_id()` (genera `headers.msg_id` si falta).
+* `from_neighbor`: ID del vecino por cuyo canal físico/lógico llegó el paquete (puede ser `"unknown"`).
+
+**Valor de retorno (contrato con `router.py`):**
+
+* `None`: consumir/terminar (no reenviar).
+* `"flood_lsa"`: `router.py` debe **retransmitir en broadcast** a todos salvo el emisor (y manejar TTL--/exclusión).
+* `"<neighbor_id>"`: hacer **unicast** al vecino indicado (siguiente salto).
+* `"flood"`: reservado, no usado aquí.
+
+#### Flujo por tipo de mensaje
+
+##### 1. HELLO
+
+* **Objetivo:** solo **refrescar** estado del vecino. **No** se retransmite.
+* **Lógica clave:**
+
+  * `packet.ensure_msg_id()` se intenta de forma defensiva.
+  * Determina `nb_id`:
+
+    1. prioriza `from_neighbor` si viene distinto de `"unknown"`;
+    2. si no, usa `packet.from_addr` **solo** si ya es un vecino conocido en `self.neighbors`.
+  * Si hay `nb_id`:
+
+    * actualiza/crea `neighbor_states[nb_id]` con `last_seen=now`, `alive=True` y **asegura** `cost`.
+    * refleja el costo en `self.neighbors[nb_id]`.
+    * marca `topology_changed = True` (opcionalmente se podría recalcular en caliente).
+* **Retorno:** `None`.
+
+> Nota: si llega un HELLO de un remitente desconocido **y** el canal también es `"unknown"`, no se crea el vecino automáticamente (se espera un `update_neighbor` desde `router.py`).
+
+##### 2. INFO / LSA (`packet.type in {"lsa","info"}`)
+
+* **Objetivo:** integrar un **Link State Advertisement** a la LSDB y decidir si debe **floodearse**.
+* **Pasos:**
+
+  1. **Anti-loop** por ventana de 3 en `headers.path`: `handleHeadersPath(packet)` (método interno).
+
+     * Si devuelve `False`, **descarta** (ciclo detectado o `path` inválido).
+  2. **Parseo** de `payload` JSON y **anti-spoof**:
+
+     * `data = json.loads(packet.payload)`
+     * `origin_field` (en payload) **debe** coincidir con `packet.from_addr`; si no, descarta.
+     * Extrae `origin`, `seq: int`, `neighbors: Dict[str, int]`.
+  3. **Deduplicación y orden**:
+
+     * Usa `(origin, seq)` como clave; si ya está en `lsa_seen`, descarta.
+     * Mantiene LRU con `lsa_fifo` acotado a `lsa_capacity`.
+     * Si existe en `link_state_db[origin]` con `seq_actual >= seq`, descarta por **obsolescencia**.
+  4. **Aceptación y almacenamiento** (bajo `_lock`):
+
+     * `link_state_db[origin] = {"seq", "neighbors", "last_received"}`
+       (con claves de vecinos `str(...)` y costos `int(...)` normalizados).
+     * Actualiza `area_routers` con `origin`, sus vecinos y `self.router_id`.
+     * Llama a `self.calculateRoutes()` para recomputar SPF (genera/actualiza `routing_table`).
+  5. **Flood controlado**:
+
+     * Retorna `"flood_lsa"` para que `router.py` retransmita a **otros** vecinos (excluyendo al emisor y ajustando TTL).
+* **Retorno:** `"flood_lsa"` si se integró un LSA nuevo; `None` si se descartó.
+
+> **Formato esperado de LSA (payload JSON):**
+>
+> ```json
+> {
+>   "origin": "R1",
+>   "seq": 12,
+>   "neighbors": { "R2": 5, "R3": 1 }
+> }
+> ```
+
+##### 3. Mensajes unicast / echo
+
+* Para `type` distintos de `hello` y `lsa/info`, se asume **unicast**.
+* **Acción:** delega en `get_next_hop(packet.to_addr)` y retorna ese vecino (o `None` si no hay ruta).
+
+### `get_next_hop(destination: str) -> Optional[str]`
+
+**Propósito:** Resolver el **siguiente salto** (vecino) hacia un destino final usando la `routing_table` calculada por SPF.
+
+**Parámetros**
+
+* `destination`: ID del router destino final.
+
+**Retorna**
+
+* `neighbor_id` (str) si hay ruta en `routing_table`.
+* `None` si:
+
+  * el destino es el propio router (`destination == self.router_id`), o
+  * no existe ruta conocida.
+
+**Notas**
+
+* Lectura ligera (O(1)). Se apoya en que `calculateRoutes()` mantiene `routing_table` coherente.
+
+### Interacciones y contratos cruzados
+
+* **`router.py`**
+
+  * Invoca `update_neighbor()` cuando cambia la adyacencia/costo físico.
+  * Entrega cada paquete a `process_packet()`.
+
+    * Si recibe `"flood_lsa"`, **retransmite** en broadcast a todos menos el emisor y aplica políticas (TTL--, evitar eco).
+    * Si recibe `"<neighbor_id>"`, **reenvía unicast** por ese canal.
+    * Si recibe `None`, **consume** el paquete.
+* **`Packet`**
+
+  * Debe soportar `ensure_msg_id()`, y exponer `type`, `from_addr`, `to_addr`, `payload` y `headers.path`.
+* **Métodos internos no mostrados aquí**
+
+  * `handleHeadersPath(packet) -> bool`: valida la ventana de 3 saltos en `headers.path` (detección de loops).
+  * `calculateRoutes()`: ejecuta SPF (Dijkstra) sobre `link_state_db` + enlaces directos (`self.neighbors`) y actualiza `routing_table`.
+    *(OJO: en un comentario aparece `calculate_routes()`; mantener una sola convención.)*
+
+### Errores y condiciones límite
+
+* **HELLO desconocido:** si no se puede mapear a `nb_id` (canal `"unknown"` y `from_addr` no está en `self.neighbors`), no se crea/actualiza estado (se espera `update_neighbor()`).
+* **LSA inválido:** JSON malformado, `origin` falsificado, `seq` obsoleto o **duplicado** → se descarta silenciosamente (`None`).
+* **LRU de LSAs:** si se supera `lsa_capacity`, se expulsa la entrada más antigua de `lsa_fifo` y su marca en `lsa_seen` para evitar crecimiento sin límite.
+
+### Ejemplo de decisiones de `process_packet`
+
+| Entrada                                    | Estado                     | Retorno       | Acción de `router.py` |
+| ------------------------------------------ | -------------------------- | ------------- | --------------------- |
+| `type="hello"` desde vecino conocido       | —                          | `None`        | Solo refresca vecino  |
+| LSA nuevo con `seq` mayor                  | LSDB actualizada           | `"flood_lsa"` | Re-flood controlado   |
+| LSA duplicado (`(origin,seq)` ya visto)    | —                          | `None`        | Consumir              |
+| `type="message"` a `to_addr="R9"` con ruta | `routing_table["R9"]="R2"` | `"R2"`        | Unicast hacia `R2`    |
+| `type="message"` a destino sin ruta        | no hay entrada             | `None`        | Drop                  |

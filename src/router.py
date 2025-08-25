@@ -784,6 +784,7 @@ class RedisRouter(BaseRouter):
         self._rx_seen_ids = set()     # deduplicación (si ya lo agregaste, deja igual)
         self._rx_seen_fifo = deque()
         self._rx_seen_capacity = 50000
+        self.active_connections = {} # Varible dummy
 
     def _log_packet(self, action: str, packet, neighbor: str = None):
         """Uniform packet activity log (mirrors Socket router)."""

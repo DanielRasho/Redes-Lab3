@@ -187,3 +187,81 @@ class LinkStateRouting(RoutingAlgorithm):
         if destination == self.router_id:
             return None
         return self.routing_table.get(destination)
+
+    # ===== Emisión periódica de HELLO / INFO (router.py consulta estos) =====
+
+    def should_send_hello(self) -> bool:
+        return (time.time() - self.last_hello_time) >= self.HELLO_INTERVAL
+
+    def create_hello_packet(self) -> Packet:
+        """
+        Crea HELLO (no se retransmite). Se usa para presencia/refresh de vecinos.
+        """
+        self.last_hello_time = time.time()
+        headers = {"msg_id": uuid.uuid4().hex, "ts": self.last_hello_time, "path": []}
+        return Packet(
+            proto=self.get_name(),
+            packet_type="hello",
+            from_addr=self.router_id,
+            to_addr="broadcast",  # estándar del curso
+            ttl=5,
+            headers=headers,
+            payload=""  # payload vacío según guía
+        )
+
+    def should_send_lsa(self) -> bool:
+        now = time.time()
+        if self.topology_changed and (now - self.last_lsa_time) >= self.LSA_MIN_INTERVAL:
+            return True
+        if (now - self.last_lsa_time) >= self.LSA_REFRESH_INTERVAL:
+            return True
+        return False
+
+    def create_lsa_packet(self) -> Packet:
+        """
+        Emite mi LSA como paquete INFO (compatibilidad: receptor acepta "lsa" o "info").
+        Pre-instala mi propio LSA en la LSDB y en el filtro de duplicados.
+        """
+        self.my_lsa_seq += 1
+        self.last_lsa_time = time.time()
+        self.topology_changed = False
+
+        # Vecinos vivos en ventana de timeout
+        neighs: Dict[str, int] = {}
+        now = time.time()
+        with self._lock:
+            for nb, st in self.neighbor_states.items():
+                if st.get("alive", False) and (now - st.get("last_seen", 0)) < self.NEIGHBOR_TIMEOUT:
+                    neighs[nb] = int(st.get("cost", 1))
+
+            # Pre-instalo mi propio LSA en LSDB y dedupe
+            self.link_state_db[self.router_id] = {
+                "seq": self.my_lsa_seq,
+                "neighbors": dict(neighs),
+                "last_received": self.last_lsa_time,
+            }
+            key = (self.router_id, self.my_lsa_seq)
+            if len(self.lsa_fifo) >= self.lsa_capacity:
+                old = self.lsa_fifo.popleft()
+                self.lsa_seen.discard(old)
+            self.lsa_fifo.append(key)
+            self.lsa_seen.add(key)
+
+        self.calculateRoutes()
+        payload = {
+            "origin": self.router_id,
+            "seq": self.my_lsa_seq,
+            "neighbors": neighs,
+            "ts": self.last_lsa_time
+        }
+        headers = {"msg_id": uuid.uuid4().hex, "seq": self.my_lsa_seq, "path": []}
+
+        return Packet(
+            proto=self.get_name(),
+            packet_type="info",      # <-- estándar acordado
+            from_addr=self.router_id,
+            to_addr="broadcast",
+            ttl=16,
+            headers=headers,
+            payload=json.dumps(payload)
+        )

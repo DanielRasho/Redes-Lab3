@@ -41,7 +41,7 @@ Start a router node is as easy as **3 steps**:
 3. Start a node by passing the right arguments!
 
 ```bash
-python c.py --id A --algorithm flooding --topo topo.json --names names.json
+python main.py --id A --algorithm flooding --topo topo.json --names names-redis.json
 ```
 
 ## Project Structure

@@ -1,7 +1,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{fontspec}
 \setmainfont{FiraCode Nerd Font}
-\setmonofont{FiraCode Nerd Font Mono}
+\setmonofont{FiraCode Nerd Font Mono}[Scale=0.9]
 \usepackage{microtype}
 \usepackage{graphicx}
 \setkeys{Gin}{width=\linewidth,keepaspectratio} % escala imágenes al ancho del texto
@@ -13,3 +13,15 @@
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
 \usepackage{setspace}
 \setstretch{1.5}
+
+% --- Para que los bloques de código con highlighting hagan wrap ---
+\usepackage{fvextra}           % extensión de fancyvrb (Pandoc usa Highlighting)
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}%
+ {breaklines,breakanywhere,commandchars=\\\{\},fontsize=\small}
+\DefineVerbatimEnvironment{Verbatim}{Verbatim}%
+ {breaklines,breakanywhere,fontsize=\small}
+\emergencystretch=2em
+
+% (opcional) fondo suave para Shaded de pandoc
+\usepackage{framed,xcolor}
+\definecolor{shadecolor}{RGB}{248,248,248}

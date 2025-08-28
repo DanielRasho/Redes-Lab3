@@ -6,8 +6,9 @@
 
 ## Resumen
 
-Este proyecto implementa un plano de control simple con **Link State Routing (LSR)** sobre **Redis Pub/Sub**.
-Cada router (A, B, C, D) mantiene su tabla de enrutamiento calculada con Dijkstra a partir de LSAs difundidos por flooding.
+Este documento presenta la Parte 1 del Laboratorio 3 — implementación y pruebas locales de algoritmos de enrutamiento sobre sockets y Redis.
+Se cubren el objetivo del laboratorio, la implementación de **Flooding** como mecanismo de reenvío básico, así como la integración y validación de **Link State Routing (LSR) sobre Redis Pub/Sub**, que incluye el intercambio de *hellos*, difusión de *LSAs* y cálculo de rutas mediante el algoritmo de **Dijkstra**.
+Se muestran las pruebas en topologías en lazo (A–B–C–D), evidenciando robustez frente a duplicados, cálculo correcto de rutas y envío unicast exitoso.
 
 ## Requisitos
 
@@ -19,8 +20,8 @@ Cada router (A, B, C, D) mantiene su tabla de enrutamiento calculada con Dijkstr
 
 - Comprender y aplicar algoritmos de enrutamiento en una red simulada localmente.
 - Implementar y probar los mecanismos de *forwarding* y *routing* (Flooding como entregable principal de esta Parte 1).
-- Avanzar con pruebas preliminares de LSR, aunque su evaluación formal corresponde a la Parte 2.
-- Evaluar el comportamiento (estabilidad, duplicados en Flooding, TTL, descubrimiento de vecinos) en topologías con bucles.
+- Validar la implementación de **LSR sobre Redis Pub/Sub**, verificando la propagación de LSAs y el cálculo de rutas mínimas.
+- Evaluar el comportamiento (estabilidad, duplicados en Flooding, TTL, descubrimiento de vecinos, cálculo de rutas óptimas) en topologías con bucles.
 
 ## Requerimientos y formato de los archivos
 
@@ -71,7 +72,7 @@ Se probó la topología con 4 nodos formando un lazo (A–B–C–D–A). El rep
 
 *(Para los registros de ejecución y trazas, ver logs de ejecución y el historial de router.log en el repositorio — se recomiendan fragmentos de log como evidencia en la sección de Resultados.)*
 
-## 5. Resultados (resumen)
+## 5. Resultados
 
 - Flooding funciona y entrega *echo* y *echo_reply* en la topología con bucle.
 - La deduplicación por `msg_id` y TTL evitan re-propagación indefinida.
@@ -231,7 +232,7 @@ Redis router X stopped
 
 El cierre es correcto, aunque alguna tarea asincrónica puede no finalizar a tiempo.
 
-### Construcción de la tabla (vista de código)
+### Construcción de la tabla
 
 1. **Carga de topología local**: cada router inicia con sus vecinos directos.
 2. **Difusión de estado**: periódicamente se emiten `hello` y `info`.
@@ -250,7 +251,7 @@ En empates, se aplica una política determinista. La evidencia muestra que siemp
   - Reducir el nivel de logs en consola.
   - Redirigir logs a archivo.
 
-### Evidencia (extractos)
+### Evidencia
 
 - Flooding y duplicados en A:
   
@@ -272,17 +273,29 @@ En empates, se aplica una política determinista. La evidencia muestra que siemp
     C -> B
     ```
 
-![Test SLR](../../images/test_slr_fix.png)
+![Test SLR](../images/test_slr_fix.png)
 
 ## 7. Discusión y mejoras propuestas
 
-- Mejorar la caché LRU: actualmente es set+deque; podría cambiarse a `collections.OrderedDict` o `functools.lru_cache` según necesidades de memoria/eficiencia.
-- Añadir métricas de performance (tiempos de entrega, conteo de retransmisiones por mensaje) para cuantificar la sobrecarga de Flooding.
-- Implementar un modo híbrido (Flooding controlado + *forward path caching*) para reducir overhead en redes mayores.
+- **Flooding** garantiza entrega incluso sin tablas de enrutamiento, pero genera tráfico redundante.
+- **LSR sobre Redis** reduce el overhead al instalar rutas explícitas, a costa de mayor complejidad en el cálculo y sincronización.
+- En la topología probada, se observó que:
+
+  - Flooding entrega mensajes con duplicados controlados.
+  - LSR entrega mensajes unicast en un solo camino óptimo, con menos sobrecarga de red.
 
 ## 8. Conclusiones
 
-La Parte 1 cumple el objetivo principal: demostrar que la estrategia de Flooding es funcional y robusta en topologías pequeñas y con bucles, siempre y cuando exista deduplicación y TTL. Además, se adelantaron pruebas preliminares de LSR que confirman la correcta propagación de LSAs y el cálculo de rutas, aunque su análisis completo se abordará en la Parte 2.
+La Parte 1 cumple el objetivo principal: demostrar que la estrategia de **Flooding** es funcional y robusta en topologías pequeñas y con bucles, siempre y cuando exista deduplicación y TTL.
+
+Adicionalmente, se implementó un plano de control de **Link State Routing (LSR) sobre Redis Pub/Sub**, validando que:
+
+- Los nodos pueden descubrir vecinos y difundir LSAs de manera confiable.
+- La base de datos de estado de enlace (LSDB) converge en todos los nodos.
+- El algoritmo de Dijkstra permite calcular tablas de enrutamiento consistentes.
+- Los mensajes unicast llegan correctamente al destino usando las rutas mínimas.
+
+Esto demuestra que el sistema puede escalar hacia un enrutamiento más eficiente que Flooding, preparando el terreno para las siguientes fases del laboratorio.
 
 ## 9. Referencias
 

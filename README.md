@@ -1,5 +1,12 @@
 # Lab 3 - Routers simulation
 
+## Report
+
+The detailed report of this lab (in Spanish) can be found in:
+
+- [docs/reporte.md](docs/reporte.md)
+- [docs/reporte.pdf](docs/reporte.pdf)
+
 ## Dependencies
 
 ```bash
